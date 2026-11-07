@@ -908,11 +908,13 @@ test('⑲ stale status words from an older generation are removed on dispose', (
   assert.equal(h.body.collect('[data-zusage-loading-status]', []).length, 0);
 });
 
-test('⑳ deterministic history line renders at the reduced inline font size (v78)', () => {
+test('⑳ deterministic history line renders as v261 meta-line inline style', () => {
   const h = harness();
   const store = driveStreaming(h);
   const { line } = completeTurn(h, store);
-  assert.equal(line().style.fontSize, '0.8125rem');   // 内联样式，宿主正文号不再适用
+  assert.equal(line().style.fontSize, '0.75rem');     // 内联样式：12px mono + 62% 透明度，宿主正文号与引用块样式不再适用
+  assert.equal(line().style.opacity, '0.62');
+  assert.match(line().style.fontFamily, /--font-mono/);
   assert.equal(line().textContent, '⚡ 250.0 token/s(本轮) · 输出 1,000 token · 耗时 5.0s');
 });
 
@@ -935,6 +937,7 @@ test('㉑ deterministic line lands before the hover action row and after the clo
   const kids = section.children;
   const at = kids.indexOf(quote);
   assert.ok(at > 0, 'blockquote 已插入容器');
+  assert.equal(quote.style.border, '0');   // v261：包裹层剥离宿主引用块样式（透明容器）
   assert.equal(kids[at - 1], popover, '统计行在 data-state=closed 弹出层之后');
   assert.equal(kids[at + 1], actions, '统计行在 hover 工具条之前');
   // React 重排兜底：工具条被移到统计行之后时，下一个 tick 应摆回来

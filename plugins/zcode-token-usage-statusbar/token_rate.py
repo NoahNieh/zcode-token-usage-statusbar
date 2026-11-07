@@ -390,11 +390,9 @@ def _hhmmss(ms):
     return time.strftime("%H:%M:%S", time.localtime(ms / 1000))
 
 
-def _cn_fulltime(ms):
-    """本问统计行的采样时刻：完整中文日期时间（2026 年 10 月 23 日 11 点 20 分 28 秒），数字不补零。"""
-    t = time.localtime(ms / 1000)
-    return (f"{t.tm_year} 年 {t.tm_mon} 月 {t.tm_mday} 日 "
-            f"{t.tm_hour} 点 {t.tm_min} 分 {t.tm_sec} 秒")
+def _fulltime(ms):
+    """本问统计行的采样时刻：标准日期时间（2026-11-07 10:57:40），与 tooltip 时间范围行同格式。"""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ms / 1000))
 
 
 def _sec(ms):
@@ -429,7 +427,7 @@ def format_turn_line(r, cn=True, force_kmb=False):
         if s.get("sessionAvg") is not None:
             parts.append(f"会话均 {s['sessionAvg']} token/s")
         parts.append(f"累计 {big(s['totalOutput'])} token")
-    parts.append(f"⏱ {_cn_fulltime(t['lastAt'])}")
+    parts.append(f"⏱ {_fulltime(t['lastAt'])}")
     return " · ".join(parts)
 
 
