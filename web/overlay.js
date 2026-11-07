@@ -1461,9 +1461,17 @@
       return !!(s && s.ctx_exc > 0 && s.ctx_exc >= (s.last_at || 0));
     }
 
+    /* v263 缓存命中率两位小数（整值不带小数）；无输入量返回 "" 不显示。与桌面浮层同名同款。 */
+    function hitPctOf(read, cached) {
+      if (!(read > 0 && isFinite(read))) return "";
+      var v = (cached || 0) / read * 100;
+      return v % 1 ? v.toFixed(2) : String(v);
+    }
+
     function cachePct(cache, input) {
       // 无原生 title：原生提示向下弹且与自绘 tooltip 双显闪烁（v33 移除），定义见各项 tooltip 明细
-      return input > 0 ? '<span class="dim">' + Math.round(cache / input * 100) + "%</span>" : "";
+      var t = hitPctOf(input, cache);
+      return t ? '<span class="dim">' + t + "%</span>" : "";
     }
 
     /* 显示顺序：本轮 → 上下文 → 会话 → 工具 → 今日 → 子代理；token 后带缓存命中率。
@@ -1601,7 +1609,7 @@
             ? "Latest turn · " + (lt.requests || 0) + " requests"
             : "本轮 · " + (lt.requests || 0) + " 次请求") +
           ttRow(L("输入", "Input"), fmt(lt.input) +
-            (lt.input > 0 && lt.cache_read > 0 ? L("（命中 " + Math.round(lt.cache_read / lt.input * 100) + "%）", " (" + Math.round(lt.cache_read / lt.input * 100) + "% cached)") : "")) +
+            (lt.input > 0 && lt.cache_read > 0 ? L("（命中 " + hitPctOf(lt.input, lt.cache_read) + "%）", " (" + hitPctOf(lt.input, lt.cache_read) + "% cached)") : "")) +
           ttRow(L("输出", "Output"), fmt(lt.output) +
             (lt.reasoning > 0 ? L("（含思考 " + fmt(lt.reasoning) + "）", " (incl. " + fmt(lt.reasoning) + " thinking)") : "")) +
           (lt.cache_write > 0 ? ttRow(L("缓存写入", "Cache write"), fmt(lt.cache_write)) : "") +
@@ -1619,7 +1627,7 @@
           "\x01" +
           ttH(L("会话累计 · 全部请求", "Session total · all requests")) +
           ttRow(L("输入", "Input"), fmt(sess.input) +
-            (sess.input > 0 && sess.cache_read > 0 ? L("（命中 " + Math.round(sess.cache_read / sess.input * 100) + "%）", " (" + Math.round(sess.cache_read / sess.input * 100) + "% cached)") : "")) +
+            (sess.input > 0 && sess.cache_read > 0 ? L("（命中 " + hitPctOf(sess.input, sess.cache_read) + "%）", " (" + hitPctOf(sess.input, sess.cache_read) + "% cached)") : "")) +
           ttRow(L("输出", "Output"), fmt(sess.output) +
             (sess.reasoning > 0 ? L("（含思考 " + fmt(sess.reasoning) + "）", " (incl. " + fmt(sess.reasoning) + " thinking)") : "")) +
           (sess.cache_write > 0 ? ttRow(L("缓存写入", "Cache write"), fmt(sess.cache_write)) : "") +
@@ -1652,7 +1660,7 @@
           "\x01" +
           ttH(L("今日合计 · 今天所有会话", "Today · all sessions")) +
           ttRow(L("输入", "Input"), fmt(today.input) +
-            (today.input > 0 && today.cache_read > 0 ? L("（命中 " + Math.round(today.cache_read / today.input * 100) + "%）", " (" + Math.round(today.cache_read / today.input * 100) + "% cached)") : "")) +
+            (today.input > 0 && today.cache_read > 0 ? L("（命中 " + hitPctOf(today.input, today.cache_read) + "%）", " (" + hitPctOf(today.input, today.cache_read) + "% cached)") : "")) +
           ttRow(L("输出", "Output"), fmt(today.output) +
             (today.reasoning > 0 ? L("（含思考 " + fmt(today.reasoning) + "）", " (incl. " + fmt(today.reasoning) + " thinking)") : "")) +
           ttRow(L("请求", "Requests"), (today.requests || 0) +

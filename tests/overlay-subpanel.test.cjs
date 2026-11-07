@@ -87,6 +87,11 @@ test('zero-rect entry falls back to the bar anchor; a detached entry closes the 
       pickedSid: 'sid_main', subPopSess: 'sid_main',
       L: (a) => a, ttEsc: (a) => String(a), escAttr: (a) => String(a),
       fmt: () => '1', countFmt: () => '1', fmtMoney: () => '¥1', fmtTime: () => '12:00', fmtStartS: () => '2026-01-01 00:00:00',
+      hitPctOf: (read, cached) => {   // v263 切片外桩：与 overlay.js hitPctOf 同款（两位小数，整值不带小数）
+        if (!(read > 0 && isFinite(read))) return '';
+        var v = (cached || 0) / read * 100;
+        return v % 1 ? v.toFixed(2) : String(v);
+      },
       tpsBand: () => null, FXQ_ICON: '<svg class="tip-fxq"></svg>',
       fxqIcon: (models, scope) => '<svg class="tip-fxq" data-mcount="' + (models ? models.length : 0) + '" data-mscope="' + scope + '"></svg>',   // v248：KPI 问号随卡携带模型上下文（实例闭包函数，切片外桩）
       subPopIco: () => '<svg></svg>',
@@ -139,7 +144,7 @@ test('zero-rect entry falls back to the bar anchor; a detached entry closes the 
     runBuild(panel, sub, '');
     const html = panel.__html;
     assert.ok(html.includes('缓存命中率'), '输入行副行=命中率（回退 token 尾注即红）');
-    assert.ok(html.includes('67%'), '命中率 40/60=67% 进副行');
+    assert.ok(html.includes('66.67%'), '命中率 40/60=66.67% 两位小数进副行');
     assert.ok(html.includes('含思考'), '输出行副行=含思考');
     assert.ok(!/<span class="u">(?:token|次|req)<\/span>/.test(html), 'KPI 第三参单位（token/次）已退役');
   });

@@ -101,8 +101,8 @@ test('v214 project total card: KPI/details/scale/models table/time, bilingual', 
   assert.match(strip(zh), /请求次数\s*45/);
   assert.match(strip(zh), /预估费用[^]*?\$12\.50/);
   // 用量明细：命中率绿色强调、含思考次级
-  assert.match(strip(zh), /输入\s*6000\s*缓存命中率 83%/);
-  assert.match(zh, /zu-pj-hit">缓存命中率 83%</);
+  assert.match(strip(zh), /输入\s*6000\s*缓存命中率 83.33%/);
+  assert.match(zh, /zu-pj-hit">缓存命中率 83.33%</);
   assert.match(strip(zh), /输出\s*700\s*含思考 200/);
   assert.match(strip(zh), /缓存写入\s*30/);
   // 运行规模（含子代理已在标题区，不重复）
@@ -160,7 +160,7 @@ test('v246 turn/today cards lead with total tokens and the tools table dims sub-
   const strip = s => s.replace(/<[^>]+>/g, '');
   const turn = render(data).find(tip => tip.includes('zu-stat-tip--turn'));
   assert.match(strip(turn), /总用量\s*752/, '本轮首格=总用量（回退「请求次数」即红）');
-  assert.match(turn, /缓存命中率 83%/, '本轮输入行副行=命中率');
+  assert.match(turn, /缓存命中率 83.33%/, '本轮输入行副行=命中率');
   assert.doesNotMatch(strip(turn), /请求次数/);   // 请求次数只在标题徽标，不再占 KPI 首格
   const today = render(data).find(tip => tip.includes('zu-stat-tip--today'));
   assert.match(strip(today), /总用量\s*900/, '今日首格=总用量');
