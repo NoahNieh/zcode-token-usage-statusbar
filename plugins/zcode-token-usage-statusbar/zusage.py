@@ -5,6 +5,7 @@
 也可被 usage_mcp.py import 为查询库。
 """
 import hashlib
+import bisect
 import fnmatch
 import json
 import os
@@ -109,10 +110,11 @@ _AGG_TTL_MS = 2000   # 聚合短缓存：今日合计/会话池是慢变量，2s
 _AGG_CACHE = {}
 
 
-def _cached_agg(key, fn):
+def _cached_agg(key, fn, ttl_ms=None):
+    ttl = _AGG_TTL_MS if ttl_ms is None else ttl_ms
     now = int(time.time() * 1000)
     hit = _AGG_CACHE.get(key)
-    if hit and now - hit[0] < _AGG_TTL_MS:
+    if hit and now - hit[0] < ttl:
         return hit[1]
     val = fn()
     if len(_AGG_CACHE) > 8:
@@ -1085,6 +1087,136 @@ def _turn_rate(rows, covers=frozenset()):
 def _rated_tps(tokens, gen_ms):
     """加权平均 t/s：Σ有效 output ÷ Σ有效生成窗口；窗口为 0（无有效样本）时返回 0。"""
     return round(tokens / (gen_ms / 1000), 1) if gen_ms else 0
+
+
+_REPORT_RANGES = ("today", "d7", "d30")
+
+
+def _report_day_index(bounds, completed_ms):
+    """completed_ms 落在 bounds（升序本地零点毫秒）中的第几天；越界归 -1/末位。"""
+    di = bisect.bisect_right(bounds, completed_ms) - 1
+    if di < 0:
+        return -1
+    return min(di, len(bounds) - 1)
+
+
+def _report_stats(con, covers=frozenset()):
+    """用量报表聚合（快照可选字段 stats，仅桌面链，v260）：近 30 天 completed 行
+    单次扫描分桶。范围桶 today/d7/d30 × (model_id, provider_id)：全部行累计
+    tokens/次数（与今日合计、models 报表同口径，含子代理），速度仅 main_turn 行按
+    _row_gen_ms 窗口（200ms–1h 有效段）累计——与状态条会话均同口径，辅助 query_source
+    与子代理行不进速度分母。日桶 × (model, provider) 供每日费用。范围/日均本地自然日
+    闭区间（today=今日，d7=今日+前 6 天，d30=今日+前 29 天，同 daily_usage 语义）。
+    出口按 model_id 合并、total 降序，provider 取请求数最多者展示；价表模块可用时带
+    cost_usd/rates（缺失省略费用字段，token 照常输出）。sessions 复用 recent_sessions
+    并过滤子会话。"""
+    bounds = [_epoch_ms(_day_start(datetime.now() - timedelta(days=i)))
+              for i in range(29, -1, -1)]
+    rng, day = {}, {}   # (范围桶, model, prov) / (日桶, model, prov) → 累计数组
+    for r in con.execute(
+            """select model_id, provider_id, input_tokens, output_tokens,
+                      cache_read_input_tokens, cache_creation_input_tokens,
+                      started_at, first_token_at, completed_at, reasoning_tokens, query_source
+               from model_usage
+               where status='completed' and completed_at >= ?""", (bounds[0],)):
+        di = _report_day_index(bounds, r[8] or 0)
+        if di < 0:
+            continue
+        model, prov = r[0] or "", r[1] or ""
+        inp, out = r[2] or 0, r[3] or 0
+        cr, cw = r[4] or 0, r[5] or 0
+        for b in ((0, 1, 2) if di == 29 else ((1, 2) if di >= 23 else (2,))):
+            a = rng.setdefault((b, model, prov), [0, 0, 0, 0, 0, 0, 0, 0])
+            a[0] += 1
+            a[1] += inp
+            a[2] += out
+            a[3] += cr
+            a[4] += cw
+            if r[10] is None or r[10] == "main_turn":
+                gen = _row_gen_ms(r, covers)
+                if out > 0 and gen and _TPS_MIN_GEN_MS <= gen < _TPS_MAX_GEN_MS:
+                    a[5] += out
+                    a[7] += gen
+                else:
+                    a[6] += out
+        d = day.setdefault((di, model, prov), [0, 0, 0, 0, 0, 0])
+        d[0] += 1
+        d[1] += inp
+        d[2] += out
+        d[3] += cr
+        d[4] += cw
+
+    def _bucket_rows(b):
+        per, groups = {}, []
+        for (bk, model, prov), v in rng.items():
+            if bk != b:
+                continue
+            a = per.setdefault(model, {"model": model, "requests": 0, "input": 0,
+                                       "output": 0, "rated_output": 0,
+                                       "unrated_output": 0, "gen_ms": 0, "_pv": {}})
+            a["requests"] += v[0]
+            a["input"] += v[1]
+            a["output"] += v[2]
+            a["rated_output"] += v[5]
+            a["unrated_output"] += v[6]
+            a["gen_ms"] += v[7]
+            a["_pv"][prov] = a["_pv"].get(prov, 0) + v[0]
+            groups.append((model, prov, v[1], v[2], v[3], v[4]))
+        per_cost = {}
+        if _pricing is not None and groups:
+            try:
+                _, per_cost = _pricing.merge_model_costs(groups)
+            except Exception:
+                per_cost = {}
+        rows = []
+        for model, a in per.items():
+            prov = max(a["_pv"].items(), key=lambda kv: kv[1])[0]
+            row = {"model": model, "provider": prov,
+                   "requests": a["requests"], "input": a["input"], "output": a["output"],
+                   "total": a["input"] + a["output"],
+                   "tps": _rated_tps(a["rated_output"], a["gen_ms"]),
+                   "rated_output": a["rated_output"], "unrated_output": a["unrated_output"]}
+            if _pricing is not None:
+                if model in per_cost:
+                    row["cost_usd"] = per_cost[model]
+                row["rates"] = _model_rates(model, prov).get("rates")
+            rows.append(row)
+        rows.sort(key=lambda m: -m["total"])
+        return rows
+
+    days = []
+    for di in range(30):
+        label = datetime.fromtimestamp(bounds[di] / 1000).strftime("%m-%d %a")
+        row = {"d": label, "requests": 0, "input": 0, "output": 0, "total": 0}
+        groups = []
+        for (d2, model, prov), v in day.items():
+            if d2 != di:
+                continue
+            row["requests"] += v[0]
+            row["input"] += v[1]
+            row["output"] += v[2]
+            row["total"] += v[1] + v[2]
+            groups.append((model, prov, v[1], v[2], v[3], v[4]))
+        if _pricing is not None and groups:
+            try:
+                _, per_cost = _pricing.merge_model_costs(groups)
+                if per_cost:
+                    row["cost_usd"] = sum(per_cost.values())
+            except Exception:
+                pass
+        days.append(row)
+    sess = []
+    for r in recent_sessions(con, 20):
+        sid = str(r[0] or "")
+        if _is_sub_session(sid):
+            continue
+        sess.append({"sid": sid, "title": r[1] or "", "directory": r[2] or "",
+                     "requests": r[3] or 0,
+                     "total": (r[4] or 0) + (r[5] or 0), "last_at": r[7] or 0})
+        if len(sess) >= 10:
+            break
+    return {"models": {rid: _bucket_rows(i) for i, rid in enumerate(_REPORT_RANGES)},
+            "days": days, "sessions": sess}
 
 
 def _speed_segments(con, sid, covers=frozenset()):
@@ -2145,6 +2277,9 @@ def snapshot(force_sid="", routes=None, serve_con=None):
         local_error = str(exc)[:200]
     try:
         force_sids = []
+        # 先置缺省：today 链失败进外层 except 时（con 存活但查询中途出错），字典组装
+        # 不得因未绑定局部变量整帧崩溃（2026-11-07 用量报表 fail-soft 测试收编同款修复）
+        today_detail, today_cost, stats = None, None, None
         for fs in str(force_sid).split(","):
             fs = fs.strip()
             if fs and re.fullmatch(r"[A-Za-z0-9_-]+", fs) and fs not in force_sids:
@@ -2161,6 +2296,20 @@ def snapshot(force_sid="", routes=None, serve_con=None):
                 return {"cost": cost, "models": models if models else []}
             today_detail = _cached_agg(("todaydetail", start_ms), _today_detail) if con else None
             today_cost = today_detail["cost"] if today_detail else None
+
+            # v260 用量报表聚合（可选增强字段 stats）：近 30 天单次扫描分桶；键带窗口
+            # 起点跨零点自动失效。扫描实测百毫秒级，ttl 放宽到 5s（报表是慢变量，
+            # 摊薄常驻泵占空比）。任何失败省略字段不拖垮整帧，渲染端判空不渲染
+            # （热文件先于冷文件部署是常态）。
+            if con is not None:
+                def _report_detail():
+                    return _report_stats(con, _provider_first_token_covers(con))
+                try:
+                    stats = _cached_agg(
+                        ("report", _epoch_ms(_day_start() - timedelta(days=29))),
+                        _report_detail, ttl_ms=5000)
+                except Exception:
+                    stats = None
             rows = _scan_session_ids(con) if con else []
             have_local = set()
             if con and force_sids:
@@ -2266,6 +2415,8 @@ def snapshot(force_sid="", routes=None, serve_con=None):
                 **({"cost_usd": today_cost} if today_cost is not None else {}),
                 **({"models": today_detail["models"]} if today_detail and today_detail["models"] else {}),
             },
+            # v260 用量报表聚合（可选增强字段；仅桌面快照链，MCP/CLI 契约不加字段）
+            **({"stats": stats} if stats is not None else {}),
             # 远端数据源（v12）：显示远端会话时 overlay 按其 remote_target 取对应主机的今日值；
             # dict 键=目标键。remote_error 保留首个错误（旧字段），remote_errors 按目标细分。
             "remote_today": remote_today,
