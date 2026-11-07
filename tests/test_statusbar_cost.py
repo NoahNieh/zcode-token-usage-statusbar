@@ -164,6 +164,28 @@ class SessionCostTests(CostBase):
             self.assertNotIn("cost_usd", it3["s_sub1"])
             self.assertNotIn("models", it3["s_sub1"])
 
+    def test_sub_cost_includes_workflow_child_rows(self):
+        """动态工作流派发（query_source='workflow_child'，会话 sess_dwf-*）与 Task 子代理
+        同口径计入 sub.cost_usd / sub.models / sub.list[].cost_usd；两条链互不掺入。"""
+        con = self.fixture()
+        con.execute("insert into session (id, title, parent_id, project_id, directory, time_created)"
+                    " values ('sess_dwf-dwfrun-x', 't', 's', 'proj_repo', '/repo', 101)")
+        ins(con, "r1", "sess_dwf-dwfrun-x", "GLM-5.3", "account:bigmodel-x", 1_000_000, 0,
+            qsource="workflow_child")
+        ins(con, "r2", "sess_dwf-dwfrun-x", "GLM-5.3", "account:bigmodel-x", 500_000, 0,
+            qsource="workflow_child")
+        snap = zusage._session_snapshot(con, "s", {"context_window": 200000})
+        self.assertAlmostEqual(snap["sub"]["cost_usd"], round(1.5 * 1.19516, 8))
+        by = {m["model"]: m for m in snap["sub"]["models"]}
+        self.assertEqual(by["GLM-5.3"]["requests"], 2)
+        items = {it["sid"]: it for it in snap["sub"]["list"]}
+        self.assertAlmostEqual(items["sess_dwf-dwfrun-x"]["cost_usd"], 1.5 * 1.19516)
+        # 主会话行不进子代理群、子代理行不进主会话费用
+        ins(con, "r3", "s", "GLM-5.3", "account:bigmodel-x", 1_000_000, 0)
+        snap2 = zusage._session_snapshot(con, "s", {"context_window": 200000})
+        self.assertAlmostEqual(snap2["sub"]["cost_usd"], round(1.5 * 1.19516, 8))
+        self.assertAlmostEqual(snap2["cost_usd"], 1.19516)
+
     def test_error_rows_excluded(self):
         con = self.fixture()
         ins(con, "r1", "s", "GLM-5.3", "account:bigmodel-x", 1_000_000, 0)

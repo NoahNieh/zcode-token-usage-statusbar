@@ -290,6 +290,53 @@ class SessionPrefixTests(unittest.TestCase):
         self.assertIn("前缀", zusage.render_session_detail(con, "  "))
 
 
+class SessionDetailWorkflowSubTests(unittest.TestCase):
+    """session 明细（render_session_detail）子代理段并入动态工作流派发：
+    workflow_child 行（sess_dwf-*）与 Task 子代理并列计入小计，dwf 条目带来源标注。"""
+
+    def _con(self):
+        con = fixture(sqlite3.connect(":memory:"))
+        self.addCleanup(con.close)
+        # 本文件 SCHEMA 未含 part；_sub_agent_tasks 的 stamp 查询需要它，按需补
+        con.executescript(
+            "create table part (session_id text, data text, time_created integer, time_updated integer);")
+        return con
+
+    def _seed(self, con):
+        con.execute("insert into session (id, title, parent_id, time_created)"
+                    " values ('session_main', 'Main', null, 10)")
+        con.execute("insert into session (id, title, parent_id, time_created)"
+                    " values ('sess_subagent_abc123', 'sub title', 'session_main', 20)")
+        con.execute("insert into session (id, title, parent_id, time_created)"
+                    " values ('sess_dwf-dwfrun-x', 'run script', 'session_main', 30)")
+        for rid, sid, src, total in (("r_sub", "sess_subagent_abc123", "subagent", 1000),
+                                     ("r_wf", "sess_dwf-dwfrun-x", "workflow_child", 2500)):
+            con.execute("insert into model_usage (id, session_id, turn_id, query_source, model_id,"
+                        " status, started_at, completed_at, computed_total_tokens)"
+                        " values (?, ?, 't', ?, 'GLM-5.3', 'completed', 100, 200, ?)",
+                        (rid, sid, src, total))
+
+    def test_workflow_child_listed_with_wf_mark_and_counted(self):
+        con = self._con()
+        self._seed(con)
+        with mock.patch.object(zusage, "_LANG", "zh"):
+            text = zusage.render_session_detail(con, "session_ma")
+        self.assertIn("子代理: 2 个 / 2req / 合计 3,500", text)   # 两类行都进小计
+        wf_line = next(ln for ln in text.splitlines() if "run-x" in ln)
+        self.assertIn("[工作流] ", wf_line)   # dwf 条目带来源标注（名称列前缀）
+        sub_line = next(ln for ln in text.splitlines() if "bc123" in ln)
+        self.assertNotIn("[工作流]", sub_line)   # Task 子代理条目无标注
+        self.assertNotIn("[wf] ", text)
+
+    def test_workflow_child_mark_follows_language(self):
+        con = self._con()
+        self._seed(con)
+        with mock.patch.object(zusage, "_LANG", "en"):
+            text = zusage.render_session_detail(con, "session_ma")
+        self.assertIn("[wf] ", text)
+        self.assertNotIn("[工作流]", text)
+
+
 class McpNullIdTests(unittest.TestCase):
     """显式 "id": null 是请求不是通知（复查 MINOR）：须回 id null，不得静默。"""
 

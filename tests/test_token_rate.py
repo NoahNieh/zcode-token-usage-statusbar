@@ -465,6 +465,23 @@ class TestSessionAverage(RateTestBase):
         self.assertEqual(data["session"]["sessionAvg"], 145.8)
         self.assertEqual(data["session"]["requests"], 4)
 
+    def test_workflow_child_rows_never_enter_session_avg(self):
+        """动态工作流派发行（宿主 CreateWorkflow 落库：query_source='workflow_child'、
+        会话 sess_dwf-*）与 subagent 同款排除：不进逐问样本也不进会话累计。"""
+        con = sqlite3.connect(self.db)
+        con.executemany(
+            "insert into model_usage values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [  # scope 过滤（main_turn 且本会话），不进分母
+                ("w1", "sess_dwf-dwfrun-1", "turn_w", "workflow_child", "test-model", "completed",
+                 self.t0, self.t0 + 1000, self.t0 + 11000, 1000, 10, 99999, 0, 0, "account:fixture"),
+            ])
+        con.commit()
+        con.close()
+        data = json.loads(self.run_rate("--json").stdout)
+        self.assertEqual(data["session"]["sessionAvg"], 145.8)
+        self.assertEqual(data["session"]["requests"], 4)
+        self.assertEqual(data["session"]["totalOutput"], 3500)
+
     def test_session_avg_follows_cover_set_window(self):
         # 落章 provider（ttft 不随推理量增长，斜率 0）含思考段按首字窗口计入会话均：
         # 每行 500 tok / 5s 窗口 → 100.0；covers 丢失时窗口前移 started_at（8s）→ 62.5

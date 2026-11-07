@@ -457,6 +457,72 @@ create table part (session_id text, data text, time_created integer, time_update
         self.assertEqual(light["sub"]["rate_avg"], 0)
         self.assertEqual(light["sub"]["list"], [])
 
+    def _wf_fixture(self):
+        """主会话 s + Task 子代理（subagent）+ 动态工作流派发（sess_dwf-*/workflow_child），
+        两类派生会话 parent 同挂主会话。窗口均为 completed − first_token（reasoning=0）。"""
+        con = sqlite3.connect(":memory:")
+        con.row_factory = sqlite3.Row
+        con.executescript(SCHEMA + """
+create table part (session_id text, data text, time_created integer, time_updated integer);
+""")
+        con.execute("insert into session (id, title) values ('s', 't')")
+        con.execute("insert into session (id, title, parent_id) values ('sess_subagent_a1', 'a1', 's')")
+        con.execute("insert into session (id, title, parent_id) values ('sess_dwf-dwfrun-x', 'run-x', 's')")
+        base = 1_000_000
+
+        def drow(rid, sid, source, started, completed, output, first_token):
+            con.execute(
+                "insert into model_usage values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (rid, sid, "turn1", source, "", "account:test", "GLM-5.3", "completed",
+                 started, first_token, completed, completed - started,
+                 (completed - first_token) if first_token else None, 10, output, 0, 0, 0,
+                 output + 10, 0, 0, 0))
+        # 主会话一行：441 tok / 4316ms 窗口 → 102.2 t/s（防泄漏参照）
+        drow("m1", "s", "main_turn", base, base + 10000, 441, base + 10000 - 4316)
+        # Task 子代理：500 tok / 10s → 50.0
+        drow("sa1", "sess_subagent_a1", "subagent", base + 20000, base + 30000, 500, base + 20000)
+        # 工作流派发：1000 tok / 10s → 100.0，最后完成 → list 首位
+        drow("sw1", "sess_dwf-dwfrun-x", "workflow_child", base + 40000, base + 50000, 1000, base + 40000)
+        return con
+
+    def test_workflow_child_rows_join_sub_dimension(self):
+        """动态工作流派发（query_source='workflow_child'，sess_dwf-*）并入「子智能体」：
+        sub 聚合与 sub.list 两类条目都计入（含逐条速率与会话均），主会话 requests/total/
+        last.tps 不掺入任何派生行。"""
+        con = self._wf_fixture()
+        self.addCleanup(con.close)
+        snap = zusage._session_snapshot(con, "s", {"context_window": 200000})
+        sub = snap["sub"]
+        self.assertEqual(sub["requests"], 2)
+        self.assertEqual(sub["total"], 510 + 1010)
+        by_sid = {e["sid"]: e for e in sub["list"]}
+        self.assertEqual(set(by_sid), {"sess_subagent_a1", "sess_dwf-dwfrun-x"})
+        self.assertEqual(by_sid["sess_subagent_a1"]["tps_avg"], 50.0)
+        self.assertEqual(by_sid["sess_dwf-dwfrun-x"]["tps_avg"], 100.0)
+        self.assertEqual(sub["rate_avg"], 75.0)   # (500+1000) / (10+10)s 加权
+        self.assertEqual(sub["list"][0]["sid"], "sess_dwf-dwfrun-x")   # 按最后完成时间降序
+        # 防泄漏：workflow_child 行不进主会话 requests/total/速率
+        self.assertEqual(snap["requests"], 1)
+        self.assertEqual(snap["total"], 451)
+        self.assertEqual(snap["last"]["tps"], 102.2)
+
+    def test_dwf_sid_is_sub_in_full_and_light_snapshots(self):
+        """快照 is_sub 按派生前缀判定：sess_dwf-* 与 sess_subagent_* 同为子会话。"""
+        con = self._wf_fixture()
+        self.addCleanup(con.close)
+        for fn in (zusage._session_snapshot, zusage._light_snapshot):
+            self.assertTrue(fn(con, "sess_dwf-dwfrun-x", {"context_window": 200000})["is_sub"],
+                            fn.__name__)
+            self.assertTrue(fn(con, "sess_subagent_a1", {"context_window": 200000})["is_sub"],
+                            fn.__name__)
+        self.assertFalse(zusage._session_snapshot(con, "s", {"context_window": 200000})["is_sub"])
+
+    def test_is_sub_session_prefixes(self):
+        """派生会话判定纯函数：Task 子代理与工作流派发前缀均按子会话归类。"""
+        self.assertTrue(zusage._is_sub_session("sess_dwf-dwfrun-x"))
+        self.assertTrue(zusage._is_sub_session("sess_subagent_agent_x"))
+        self.assertFalse(zusage._is_sub_session("sess_00000000-abc"))
+
 
 class ProviderFirstTokenWindowTests(unittest.TestCase):
     """首块落章 provider 判定（fork z1908144712 判据收编）：_provider_first_token_covers

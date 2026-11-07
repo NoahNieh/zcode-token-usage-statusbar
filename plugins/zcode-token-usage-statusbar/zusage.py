@@ -223,8 +223,9 @@ def _project_usage(con, sid, with_models=False):
     def run():
         mains = [r[0] for r in con.execute(
             """select id from session where project_id=?
-               and parent_id is null and substr(id,1,?)!='sess_subagent'""",
-            (prow[0], _SUB_PREFIX_LEN))]
+               and parent_id is null and substr(id,1,?)!='sess_subagent'
+               and substr(id,1,?)!='sess_dwf'""",
+            (prow[0], _SUB_PREFIX_LEN, _DWF_PREFIX_LEN))]
         all_ids = list(mains)
         for i in range(0, len(mains), 500):
             part = mains[i:i + 500]
@@ -457,12 +458,20 @@ def render_models(con, days=7):
 
 
 # ---------- 工作区报表 ----------
-# 口径：主会话 = directory 命中且无父且非 sess_subagent 前缀；子代理按 parent_id 归并去重。
-# 子代理会话（sess_subagent_*）的 directory 字段也等于工作区目录，直接按 directory 聚合会把
-# 主/子重复计数，必须走 parent_id 归并。报表单连接一次算齐——库实时写入，分次查询之间对不上账。
+# 口径：主会话 = directory 命中且无父且非派生会话前缀；子代理按 parent_id 归并去重。
+# 子代理会话（sess_subagent_*）与工作流派发会话（sess_dwf-*）的 directory 字段也等于
+# 工作区目录，直接按 directory 聚合会把主/子重复计数，必须走 parent_id 归并。
+# 报表单连接一次算齐——库实时写入，分次查询之间对不上账。
 # 会话迁移过工作区时历史用量全部记在当前目录名下（model_usage 无工作区维度）。
 
 _SUB_PREFIX_LEN = 13   # len("sess_subagent")
+_DWF_PREFIX_LEN = 8    # len("sess_dwf")
+
+
+def _is_sub_session(sid):
+    """派生会话判定：Task 子代理（sess_subagent_*）与动态工作流派发（sess_dwf-*，其
+    用量行 query_source 落 workflow_child）都不作为主会话/normal 候选，按子会话归类。"""
+    return sid.startswith("sess_subagent") or sid.startswith("sess_dwf")
 
 
 def _usage_rows(con, sids):
@@ -516,6 +525,7 @@ def render_workspace(con, pattern, top=15):
     mains = con.execute(
         f"""select id, title, time_created from session
            where directory in ({qd}) and parent_id is null and substr(id,1,{_SUB_PREFIX_LEN})!='sess_subagent'
+           and substr(id,1,{_DWF_PREFIX_LEN})!='sess_dwf'
            order by time_created""", dir_names).fetchall()
     main_ids = [r["id"] for r in mains]
     subs = []
@@ -674,8 +684,11 @@ def _sub_agent_tasks(con, sid):
     hit = _TASK_CACHE.get(sid)
     if hit and hit[0] == key:
         return hit[1]
+    # 候选只取 Task 子代理会话：工作流派发（sess_dwf-*）无 Agent part，title 是脚本
+    # 描述而非 prompt 截断头，参与前缀匹配只有误绑风险、没有命中收益。
     sub_rows_titles = {r[0]: r[1] for r in con.execute(
-        "select id, title from session where parent_id=?", (sid,))}
+        "select id, title from session where parent_id=?", (sid,))
+        if r[0].startswith("sess_subagent")}
     agent_parts = []
     for prow in con.execute(
         """select data, time_created from part
@@ -765,11 +778,13 @@ def render_session_detail(con, prefix):
             lines.append(
                 f"    {r['model_id']:<24} {r['n']:,}req  in {fmt(r[2])}  out {fmt(r[3])}  "
                 f"{L('合计', 'total')} {fmt(r[4])}")
+    # 子代理明细：Task 子代理（query_source='subagent'）与工作流派发
+    # （query_source='workflow_child'，会话 sess_dwf-*）一并计入，dwf 项加来源标注。
     sub_rows = con.execute(
         """select m.session_id, coalesce(s2.title,''), count(*),
                   coalesce(sum(m.computed_total_tokens),0), max(m.completed_at)
            from model_usage m join session s2 on m.session_id = s2.id
-           where m.query_source='subagent' and s2.parent_id=? and m.status='completed'
+           where m.query_source in ('subagent','workflow_child') and s2.parent_id=? and m.status='completed'
            group by m.session_id order by max(m.completed_at) desc""", (sid,)).fetchall()
     if sub_rows:
         tasks = _sub_agent_tasks(con, sid)
@@ -780,6 +795,8 @@ def render_session_detail(con, prefix):
             f"total {sum(r[3] for r in sub_rows):,}"))
         for r in sub_rows[:8]:
             name = tasks.get(r[0]) or r[1] or r[0]
+            if r[0].startswith("sess_dwf"):
+                name = L("[工作流] ", "[wf] ") + str(name)
             lines.append(
                 f"    {fmt(r[3]):>8}  {r[2]:>3}req  {str(name).replace(chr(10), ' ')[:30]}  [{r[0][-6:]}]")
         if len(sub_rows) > 8:
@@ -947,7 +964,7 @@ def _light_snapshot(con, sid, cfg):
         "last_at": con.execute(
             "select max(completed_at) from model_usage where session_id=? and status='completed'", (sid,),
         ).fetchone()[0] or 0,
-        "is_sub": sid.startswith("sess_subagent"),
+        "is_sub": _is_sub_session(sid),
         "parent": (srow["parent_id"] if srow is not None else None),
     }
 
@@ -1253,6 +1270,8 @@ def _session_snapshot(con, sid, cfg):
     active = bool(lr and lr[0] and int(time.time() * 1000) - lr[0] < SESSION_TIMEOUT_MS)
     ctx_auto = lookup_context_window(last["model_id"]) if last else None
     rate = _last_valid_rate(con, sid, last, covers)
+    # 子代理块含动态工作流派发：宿主把 workflow 子代理落库为 query_source='workflow_child'、
+    # 会话 sess_dwf-*（parent_id 挂主会话），与 Task 子代理一并计入"子智能体"维度。
     sub_rows = con.execute(
         """select m.session_id, coalesce(m.agent,''), coalesce(s2.title,''), count(*),
                   coalesce(sum(m.computed_total_tokens),0),
@@ -1261,7 +1280,7 @@ def _session_snapshot(con, sid, cfg):
                   coalesce(sum(m.cache_creation_input_tokens),0), max(m.completed_at), s2.time_created,
                   min(m.started_at)
            from model_usage m join session s2 on m.session_id = s2.id
-           where m.query_source='subagent' and s2.parent_id=? and m.status='completed'
+           where m.query_source in ('subagent','workflow_child') and s2.parent_id=? and m.status='completed'
            group by m.session_id order by max(m.completed_at) desc""",
         (sid,),
     ).fetchall()
@@ -1280,7 +1299,7 @@ def _session_snapshot(con, sid, cfg):
             """select m.session_id, m.output_tokens, m.first_token_at, m.completed_at,
                       m.started_at, m.reasoning_tokens, m.model_id, m.provider_id
                from model_usage m join session s2 on m.session_id = s2.id
-               where m.query_source='subagent' and s2.parent_id=? and m.status='completed'""",
+               where m.query_source in ('subagent','workflow_child') and s2.parent_id=? and m.status='completed'""",
             (sid,),
         ):
             g = sub_gen.setdefault(r["session_id"], [0, 0])
@@ -1291,7 +1310,7 @@ def _session_snapshot(con, sid, cfg):
                 g[1] += gen_ms
     now_ms = int(time.time() * 1000)
     sub_models, sub_cost = _scope_models_cost(
-        con, "query_source='subagent' and session_id in (select id from session where parent_id=?)", (sid,))
+        con, "query_source in ('subagent','workflow_child') and session_id in (select id from session where parent_id=?)", (sid,))
     sub = {
         "requests": sum(r[3] for r in sub_rows),
         "total": sum(r[4] for r in sub_rows),
@@ -1386,7 +1405,7 @@ def _session_snapshot(con, sid, cfg):
         "last_at": con.execute(
             "select max(completed_at) from model_usage where session_id=? and status='completed'", (sid,),
         ).fetchone()[0] or 0,
-        "is_sub": sid.startswith("sess_subagent"),
+        "is_sub": _is_sub_session(sid),
         "parent": (srow["parent_id"] if srow is not None else None),
     }
 
@@ -2179,9 +2198,9 @@ def snapshot(force_sid="", routes=None, serve_con=None):
 
         latest_sid = max(rows, key=lambda r: r[1])[0] if rows else None
         base = local_snapshot(latest_sid) if latest_sid else _empty_snapshot("", cfg)
-        normal = sorted((r for r in rows if not str(r[0]).startswith("sess_subagent")),
+        normal = sorted((r for r in rows if not _is_sub_session(str(r[0]))),
                         key=lambda r: -r[1])[:6]
-        suba = sorted((r for r in rows if str(r[0]).startswith("sess_subagent")),
+        suba = sorted((r for r in rows if _is_sub_session(str(r[0]))),
                       key=lambda r: -r[1])[:6]
         ids = [r[0] for r in normal] + [r[0] for r in suba]
         seen = set()

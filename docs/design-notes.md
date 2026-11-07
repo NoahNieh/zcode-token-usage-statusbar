@@ -10,7 +10,7 @@
 - 上下文容量 = 最近一次 completed 请求的 input_tokens ÷ 上下文窗口（会话压缩后自然回落，不显示峰值）。
 - "当前会话"识别（状态条）：主链路是**泵按窗口注入 mine**——渲染端经客户端自带 IPC 通道 `zcode:sync-active-task-session` 上报本窗口焦点会话 id，主进程推送时按窗口带上；overlay 只显示 mine 对应的池条目，池里没有（新会话无数据）就显示零值，**绝不回退到别的会话**（多窗口共享 localStorage 时旧启发式必错，实测）。兜底（辅助窗口/泵无该窗口信息）：读 localStorage 的 `zcode-v4-last-session:v1:<工作区路径>` 键（ZCode 切换会话即更新），值 = 会话 id，与快照 `recent`（12 条）求交集；多工作区候选时优先取刚切换的、否则取最近活跃的。**顶栏的会话标题不在可扫描的 DOM 文本节点里，标题扫描方案实测永远失败，勿回退。**
 - "当前会话"（CLI / MCP `scope=current`）= 最近 30 分钟内有请求的 session（`current_session`，状态条不用此口径）。
-- 子代理消耗 = 当前会话通过 `session.parent_id` 关联的全部子代理（`query_source='subagent'`）累计 token；● 表示 30 秒内有子代理请求（运行中）。
+- 子代理消耗 = 当前会话通过 `session.parent_id` 关联的全部子代理（`query_source in ('subagent','workflow_child')`）累计 token；● 表示 30 秒内有子代理请求（运行中）。动态工作流（CreateWorkflow）派发的子代理由宿主落库为 `query_source='workflow_child'`、会话 `sess_dwf-dwfrun-*`（parent_id 挂主会话），与 Task 子代理一并计入：Σ 合并、明细带「工作流」标识、汇总页分项小计；is_sub/recent 池按 `_is_sub_session` 同前缀归类；dwf 会话无 Agent part 回执，任务名直接用子会话标题，也不参与 prompt 兜底匹配（候选只认 `sess_subagent`）。
 - 子代理任务名 = 派发时 Agent 工具调用的 `description` 参数（与 ZCode 右侧"子智能体目录"面板同源，存 db `part` 表 Agent part 的 `state.input.description`）。与消耗记录的关联：主用**官方回执**——part 完成后 `state.output` 尾部 `agentId: agent_xxx` 行 → 子会话 id `sess_subagent_<agentId>`（客户端硬关联，零歧义）；兜底仅给运行中未出回执的条目：prompt 前缀匹配（子会话 title=prompt 前 57 字+"..."）且候选唯一才绑；配不上的显示线路名，宁无名不错名。
 - 与 ZCode 自带"设置→用量"互补：自带走供应商云端接口（套餐额度/剩余），本工具走本地 db（会话排行/上下文容量/对话内查询）。
 

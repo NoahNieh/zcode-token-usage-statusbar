@@ -32,7 +32,7 @@ Install only if you understand and accept the above. Not recommended on managed/
 - **This turn**: tokens, cache-hit rate, request count, total duration, TTFT; hover for input/output/cache/thinking breakdown and estimated cost
 - **Session total / Today**: this conversation / all conversations today (hover for details)
 - **Tools**: call count, red badge on errors, hover for per-tool durations and errors
-- **Subagents**: token spend of model-dispatched subtasks, 🟢 while one is running, click for per-agent detail
+- **Subagents**: token spend of model-dispatched subtasks — includes dynamic-workflow spawned agents (marked "workflow" in the detail panel, with a workflow subtotal in the summary); 🟢 while one is running, click for per-agent detail
 - **⚙**: display toggles, language, context-window override, update checks
 
 Context usage lives on the **context button** in the composer toolbar (ring icon + percentage): it changes colour as it fills, pops suggestions when a request is rejected for overflow, and offers one-click compaction.
@@ -90,7 +90,7 @@ To go fully offline, in `~/.zcode/zcode-token-usage-statusbar/config.json`:
 
 - One `model_usage` row = one model request; `input` already includes cache-read, `output` already includes reasoning, total = input + output.
 - Token usage ≠ a bill; "estimated cost" is list-price estimation — unmatched models fall back to a default average and can be far off.
-- Each window shows only its own focused session; subagent usage is merged via `parent_id` and never double-counted.
+- Each window shows only its own focused session; subagent usage is merged via `parent_id` and never double-counted; workflow-spawned agents (`query_source='workflow_child'`) are counted into the subagent dimension alongside Task agents.
 - Full formulas and pitfalls: [docs/design-notes.md](docs/design-notes.md), [docs/user-guide.md](docs/user-guide.md) (Chinese).
 
 ## Risk notes

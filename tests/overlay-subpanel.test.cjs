@@ -154,4 +154,68 @@ test('zero-rect entry falls back to the bar anchor; a detached entry closes the 
     assert.ok(/tps-fast[^<]*<\/span><small>t\/s<\/small>/.test(html), '平均速率档色值内联 t/s 单位');
     assert.equal((html.match(/平均速率/g) || []).length, 1, '明细页速率仅 KPI 一处（独立速率行已删）');
   });
+
+  /* 工作流派发子会话（sess_dwf-*）并入子智能体面板：导航/详情加 zu-sp-wf badge，
+   * 汇总页加「其中工作流」小计行（只聚合 dwf 条目，无 dwf 条目整行省略）。 */
+  const mkItem = (sid, total, requests) => ({
+    sid, task: '', title: sid.startsWith('sess_dwf') ? 'wf run' : 'probe', agent: '',
+    total, requests, input: 1, output: 2, cache_read: 0, reasoning: 0, cache_write: 0, tps_avg: 0, last: 123,
+  });
+  const navSegOf = (html, sid) => {
+    const at = html.indexOf('data-sid="' + sid + '"');
+    assert.ok(at > -1, 'nav has ' + sid);
+    const next = html.indexOf('<button', at);
+    return html.slice(at, next > -1 ? next : html.length);
+  };
+
+  test('workflow dispatch entries carry nav badges and drive the workflow subtotal', () => {
+    const sub = { total: 350, active: false, requests: 5, cost_usd: 0.5, models: [],
+      list: [mkItem('sess_subagent_abcd1234', 100, 1),
+             mkItem('sess_dwf-dwfrun-a', 200, 3),
+             mkItem('sess_dwf-dwfrun-b', 50, 1)] };
+    const panel = makePanel();
+    runBuild(panel, sub, '', { fmt: n => String(n), countFmt: n => String(n) });
+    const html = panel.__html;
+    assert.match(html, /<div class="zu-sp-rate">其中工作流<b>250<\/b> · 4 次请求<\/div>/,
+      '小计只聚合 dwf 条目（Task 的 100 不入）');
+    assert.ok(navSegOf(html, 'sess_dwf-dwfrun-a').includes('zu-sp-wf'), 'dwf 导航条目带 badge');
+    assert.ok(navSegOf(html, 'sess_dwf-dwfrun-b').includes('zu-sp-wf'), 'dwf 导航条目带 badge');
+    assert.ok(!navSegOf(html, 'sess_subagent_abcd1234').includes('zu-sp-wf'), 'Task 条目不带 badge');
+    assert.equal((html.match(/zu-sp-wf/g) || []).length, 2, '汇总页本体无 badge，仅导航两枚');
+  });
+
+  test('workflow detail view carries the badge in the panel head', () => {
+    const sub = { total: 10, active: false, requests: 1, cost_usd: 0.5, models: [],
+      list: [mkItem('sess_dwf-dwfrun-x', 10, 1)] };
+    const panel = makePanel();
+    runBuild(panel, sub, 'sess_dwf-dwfrun-x');
+    const html = panel.__html;
+    const head = html.slice(html.indexOf('zu-spview-head'), html.indexOf('zu-sp-kpis3'));
+    assert.ok(head.includes('zu-sp-wf'), '详情页头带工作流 badge');
+    assert.ok(head.includes('工作流'));
+  });
+
+  test('task subagent detail view has no workflow badge or subtotal', () => {
+    const sub = { total: 10, active: false, requests: 1, cost_usd: 0.5, models: [],
+      list: [{ sid: 'sess_subagent_abcd1234', task: 'probe', title: 't', agent: 'zcode-gen',
+        total: 10, requests: 1, input: 1, output: 2, cache_read: 0, reasoning: 0,
+        cache_write: 0, tps_avg: 0, last: 123 }] };
+    const panel = makePanel();
+    runBuild(panel, sub, 'sess_subagent_abcd1234');
+    const html = panel.__html;
+    assert.ok(!html.includes('zu-sp-wf'), 'Task 详情无 badge');
+    assert.ok(!html.includes('其中工作流'), '无 dwf 条目 → 小计行不出现');
+  });
+
+  test('summary omits the workflow subtotal line when no dwf entries exist', () => {
+    const sub = { total: 100, active: false, requests: 3, cost_usd: 0.5, models: [],
+      list: [{ sid: 'sess_subagent_abcd1234', task: 'probe', title: 't', agent: 'zcode-gen',
+        total: 100, requests: 3, input: 1, output: 2, cache_read: 0, reasoning: 0,
+        cache_write: 0, tps_avg: 0, last: 123 }] };
+    const panel = makePanel();
+    runBuild(panel, sub, '');
+    const html = panel.__html;
+    assert.ok(!html.includes('其中工作流'), '无 dwf 条目 → 整行省略');
+    assert.ok(!html.includes('zu-sp-wf'));
+  });
 }
