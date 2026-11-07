@@ -137,7 +137,7 @@ function harness({ prefs = {} } = {}) {
 
 const NOW = 1_799_000_000_000;
 const ROW = over => ({ model: 'GLM-5.3', provider: 'account:test', requests: 10,
-  input: 100, output: 200, total: 300, tps: 64.4, rated_output: 200, unrated_output: 0, cost_usd: 0.5, rates: {} });
+  input: 100, output: 200, total: 300, cache_read: 72, tps: 64.4, rated_output: 200, unrated_output: 0, cost_usd: 0.5, rates: {} });
 const TOTALS = over => ({ requests: 10, input: 100, output: 200, total: 300, cache_read: 80,
   cache_write: 5, reasoning: 30, rated_output: 200, unrated_output: 0, gen_ms: 4000, tps: 50.5,
   started: NOW - 600000, last_at: NOW });
@@ -154,11 +154,11 @@ function sessRow() {
     title: '主会话', input: 10000, output: 2000, reasoning: 300, cache_read: 8000, cache_write: 100,
     total: 12000, turns: 2, requests: 4, tool_calls: 1, retries: 0, started: NOW - 60000, last_at: NOW,
     avg_tps: 85.3,
-    models: [{ model: 'GLM-5.3', requests: 3, total: 1000, tps: 123.4 },
-             { model: 'claude-opus-5-5', requests: 1, total: 2000 }],
+    models: [{ model: 'GLM-5.3', requests: 3, total: 1000, tps: 123.4, input: 900, cache_read: 600 },
+             { model: 'claude-opus-5-5', requests: 1, total: 2000, input: 2000, cache_read: 0 }],
     project: { sessions: 2, turns: 5, requests: 9, input: 50000, output: 6000, reasoning: 400,
       cache_read: 40000, cache_write: 200, total: 56000, started: NOW - 120000, last_at: NOW,
-      name: 'my-proj', avg_tps: 79.2, models: [{ model: 'GLM-5.3', requests: 8, total: 3000, tps: 250 }] },
+      name: 'my-proj', avg_tps: 79.2, models: [{ model: 'GLM-5.3', requests: 8, total: 3000, tps: 250, input: 2500, cache_read: 1500 }] },
   };
 }
 const setup = h => { h.buildComposer('workspace-main', 'sid_main'); h.inject(); h.boot(); h.tick(); };
@@ -188,7 +188,23 @@ test('default view renders the session card with avg row and per-model tps colum
   assert.ok(html.includes('<th>平均速率 t/s</th>'), 'model tps column');
   assert.ok(html.includes('123.4'), 'per-model tps');
   assert.ok(html.includes('缓存命中率 80%'), 'hit pct');
+  assert.ok(html.includes('<th>缓存命中</th>'), 'model cache hit column');
+  assert.ok(html.includes('66.67%'), 'per-model cache hit (600/900)');
+  assert.ok(html.includes('<td>0%</td>'), 'zero-hit model shows 0%');
   assert.ok(!html.includes('每日趋势'), 'no daily trend in session view');
+});
+
+test('cache hit column is gated: models without input fields keep the old table', () => {
+  const h = harness(); setup(h);
+  const s = STATS();
+  s.models.today = [{ model: 'GLM-5.3', provider: 'account:test', requests: 10,
+    output: 200, total: 300, tps: 64.4, rated_output: 200, unrated_output: 0, cost_usd: 0.5, rates: {} }];   // 旧快照形态：无 input/cache_read
+  h.window.__zusageUpdate(h.payload(s));
+  h.clickTab('today');
+  const html = h.repBody().innerHTML;
+  assert.ok(!html.includes('<th>缓存命中</th>'), 'no cache hit column without input fields');
+  assert.ok(html.includes('<th>平均速率 t/s</th>'), 'tps column unaffected');
+  assert.ok(html.includes('zu-stat-table'), 'table still rendered');
 });
 
 test('project view: card renders when the picked row carries project, neutral note otherwise', () => {
@@ -202,6 +218,8 @@ test('project view: card renders when the picked row carries project, neutral no
   assert.ok(html.includes('my-proj'), 'project name');
   assert.ok(html.includes('79.2'), 'project avg tps');
   assert.ok(html.includes('250'), 'project model tps');
+  assert.ok(html.includes('<th>缓存命中</th>'), 'project model cache hit column');
+  assert.ok(html.includes('60%'), 'project model cache hit (1500/2500)');
   // 行无 project 字段（远端/轻量行）：中性提示，不渲染空卡
   const p2 = h.payload(STATS());
   h.window.__zusageUpdate(p2);
@@ -219,6 +237,8 @@ test('today view renders the totals card: tps, hit rate, cost KPI, model table; 
   assert.ok(html.includes('缓存命中率 80%'), 'hit rate from totals.cache_read');
   assert.ok(html.includes('$0.50'), 'cost KPI (Σ model cost, default $ without fx)');
   assert.ok(html.includes('64.4'), 'per-model tps in table');
+  assert.ok(html.includes('<th>缓存命中</th>'), 'range model cache hit column');
+  assert.ok(html.includes('72%'), 'per-model cache hit from stats.models');
   assert.ok(html.includes('300'), 'totals tokens');
   assert.ok(html.includes('最近会话'), 'recent sessions appended');
   assert.ok(!html.includes('每日趋势'), 'no trend in today view');

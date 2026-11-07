@@ -74,11 +74,11 @@ class ReportFixture(unittest.TestCase):
 
     @staticmethod
     def row(rid, model="GLM-5.3", prov="account:test", qs="main_turn", status="completed",
-            started=0, completed=0, ft=None, out=100, inp=10, reasoning=0, sid="s"):
+            started=0, completed=0, ft=None, out=100, inp=10, reasoning=0, sid="s", cr=0):
         """ft=None → 首字=完成前 1s（默认 1s 有效窗口）。"""
         ft = completed - 1000 if ft is None else ft
         return (rid, sid, "turn", qs, "", prov, model, status, started, ft, completed,
-                completed - started, completed - ft, inp, out, reasoning, 0, 0,
+                completed - started, completed - ft, inp, out, reasoning, cr, 0,
                 inp + out, 0, 0, 0)
 
     @staticmethod
@@ -103,6 +103,16 @@ class ReportStatsTests(ReportFixture):
         m1 = rows[1]
         self.assertEqual((m1["requests"], m1["input"], m1["output"], m1["total"]), (3, 35, 350, 385))
         self.assertEqual(m1["provider"], "account:test")   # 2 次 > 1 次
+
+    def test_model_rows_carry_cache_hit_fields(self):
+        """v264：模型明细行附 input/cache_read（缓存命中列素材，input 已含 cache_read）。"""
+        base = self.at(0)
+        self.insert(
+            self.row("a", completed=base, out=1000, inp=1000, cr=800),
+            self.row("b", model="m2", completed=base + 1000, out=50, inp=200))
+        rows = self.today_models()["today"]
+        self.assertEqual((rows[0]["input"], rows[0]["cache_read"]), (1000, 800))
+        self.assertEqual((rows[1]["input"], rows[1]["cache_read"]), (200, 0))   # 无命中 → 渲染端显 0%
 
     def test_tps_window_rule_follows_row_gen_ms(self):
         """covers provider 思考随首字流出→首字窗口；推理前置→started_at；无思考→首字窗口。"""

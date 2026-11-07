@@ -88,6 +88,23 @@ class SessionCostTests(CostBase):
         models.sort(key=lambda m: -m["total"])   # snapshot 内同款排序后断言字段仍在
         self.assertIn("cost_usd", models[0])
 
+    def test_session_models_carry_cache_hit_fields(self):
+        """v264：模型明细行附 input/cache_read（缓存命中列素材，input 已含 cache_read）。"""
+        con = self.fixture()
+        ins(con, "r1", "s", "GLM-5.3", "account:bigmodel-x", 1_000_000, 0, cr=700_000)
+        ins(con, "r2", "s", "GLM-5.3", "account:zai-x", 500_000, 0)
+        models, _ = zusage._session_models_cost(con, "s")
+        by = {m["model"]: m for m in models}
+        self.assertEqual(by["GLM-5.3"]["input"], 1_500_000)
+        self.assertEqual(by["GLM-5.3"]["cache_read"], 700_000)
+
+    def test_scope_models_carry_cache_hit_fields(self):
+        """v264：_scope_models_cost（本轮/今日/子代理模型明细）行同款附 input/cache_read。"""
+        con = self.fixture()
+        ins(con, "r1", "s", "GLM-5.3", "account:bigmodel-x", 1_000_000, 0, cr=700_000)
+        models, _ = zusage._scope_models_cost(con, "session_id=?", ("s",))
+        self.assertEqual((models[0]["input"], models[0]["cache_read"]), (1_000_000, 700_000))
+
     def test_session_snapshot_carries_cost_and_turn_cost(self):
         con = self.fixture()
         ins(con, "r1", "s", "GLM-5.3", "account:bigmodel-x", 1_000_000, 0)

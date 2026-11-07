@@ -87,7 +87,8 @@ test('v214 project total card: KPI/details/scale/models table/time, bilingual', 
     cache_read: 5000, cache_write: 30, total: 6700, tool_calls: 9, retries: 2,
     started: data.session.started, last_at: data.session.last_at,
     cost_usd: 12.5,
-    models: [{ model: 'GLM-5.3', requests: 40, total: 6000, cost_usd: 12 }, { model: 'gpt-6.1-sol', requests: 5, total: 700, cost_usd: 0.5 }],
+    models: [{ model: 'GLM-5.3', requests: 40, total: 6000, cost_usd: 12, input: 5000, cache_read: 4500 },
+             { model: 'gpt-6.1-sol', requests: 5, total: 700, cost_usd: 0.5 }],
   };
   const zh = render(data, 'zh', null, { proj: true }).find(tip => tip.includes('zu-project-tip'));
   console.error('SPANPJ:' + String(zh).slice(0, 700));
@@ -108,11 +109,11 @@ test('v214 project total card: KPI/details/scale/models table/time, bilingual', 
   // 运行规模（含子代理已在标题区，不重复）
   assert.match(strip(zh), /3 会话\s*·\s*12 轮\s*·\s*工具 9 次\s*·\s*重试 2 次/);
   assert.doesNotMatch(strip(zh).split('含子代理')[1] || '', /含子代理/);
-  // 模型明细四列表格（2 模型 ≤6 全显，无展开按钮）
+  // 模型明细五列表格（v264 缓存命中列；2 模型 ≤6 全显，无展开按钮）
   assert.match(zh, /zu-pj-table/);
-  assert.match(strip(zh), /模型\s*Token 用量 ↓\s*请求次数\s*预估费用/);
-  assert.match(strip(zh), /GLM-5\.3\s*6000\s*40\s*\$12\.00/);
-  assert.match(strip(zh), /gpt-6\.1-sol\s*700\s*5\s*\$0\.50/);
+  assert.match(strip(zh), /模型\s*Token 用量 ↓\s*请求次数\s*缓存命中\s*预估费用/);
+  assert.match(strip(zh), /GLM-5\.3\s*6000\s*40\s*90%\s*\$12\.00/);
+  assert.match(strip(zh), /gpt-6\.1-sol\s*700\s*5\s*—\s*\$0\.50/);   // 无 input 字段 → "—"
   assert.doesNotMatch(zh, /zu-pj-more/);   // N<=6 无展开按钮
   // 时间范围：em dash、精确到秒
   assert.match(zh, /2026-10-19 13:42:00 — 2026-10-19 13:43:00/);
@@ -136,6 +137,7 @@ test('v163 session total card: per-model table rows from snapshot models', () =>
   assert.match(zh, /2026-10-19 13:42:00 — 2026-10-19 13:43:00/);   // v166 精确到秒 + em dash
   assert.match(strip(zh), /GLM-5\.3\s*1200000\s*180/);
   assert.match(strip(zh), /未知模型\s*300\s*7/);
+  assert.doesNotMatch(zh, /<th>缓存命中<\/th>/);   // v264：旧快照模型无 input 字段 → 缓存命中列不渲染（门控）
   // 无 models 字段（轻量行/旧快照）：模型明细块降级但不报错
   const bare = render(fixture(), 'zh', null, { proj: false }).find(tip => tip.includes('zu-stat-tip--session'));
   assert.ok(bare, 'session card renders');

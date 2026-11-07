@@ -304,11 +304,13 @@ def _project_usage(con, sid, with_models=False):
                     from model_usage m where m.status='completed' and m.session_id in ({qm})
                     group by m.model_id, m.provider_id""", part).fetchall():
                 if with_models:
-                    acc = models_acc.setdefault(mm[0] or "", [0, 0])
+                    acc = models_acc.setdefault(mm[0] or "", [0, 0, 0, 0])
                     acc[0] += mm[2]
                     acc[1] += mm[3]
+                    acc[2] += mm[4]   # v264：每模型 input/cache_read（模型明细「缓存命中」列素材）
+                    acc[3] += mm[6]
                 cost_groups.append((mm[0] or "", mm[1] or "", mm[4], mm[5], mm[6], mm[7]))
-        models = [{"model": k, "requests": v[0], "total": v[1]}
+        models = [{"model": k, "requests": v[0], "total": v[1], "input": v[2], "cache_read": v[3]}
                   for k, v in models_acc.items()]
         if _pricing is not None:
             try:
@@ -875,11 +877,14 @@ def _session_models_cost(con, sid, covers=None):
            from model_usage where session_id=? and status='completed'
            group by model_id, provider_id""", (sid,)).fetchall():
         model = r[0] or ""
-        a = acc.setdefault(model, [0, 0])
+        a = acc.setdefault(model, [0, 0, 0, 0])
         a[0] += r[2]
         a[1] += r[3]
+        a[2] += r[4]   # v264：每模型 input/cache_read（模型明细「缓存命中」列素材，input 已含 cache_read）
+        a[3] += r[6]
         groups.append((model, r[1] or "", r[4], r[5], r[6], r[7]))
-    models = [{"model": k, "requests": v[0], "total": v[1]} for k, v in acc.items()]
+    models = [{"model": k, "requests": v[0], "total": v[1], "input": v[2], "cache_read": v[3]}
+              for k, v in acc.items()]
     if covers is not None:   # 哨兵语义：空集（无落章 provider）也是有效口径，不跳过
         try:
             rate_map = _model_rate_map(con.execute(
@@ -943,9 +948,11 @@ def _scope_models_cost(con, where, args, covers=None):
     groups = []
     for r in rows:
         model = r[0] or ""
-        a = acc.setdefault(model, [0, 0])
+        a = acc.setdefault(model, [0, 0, 0, 0])
         a[0] += r[2]
         a[1] += r[3]
+        a[2] += r[4]   # v264：每模型 input/cache_read（同 _session_models_cost 口径）
+        a[3] += r[6]
         groups.append((model, r[1] or "", r[4], r[5], r[6], r[7]))
     try:
         total, per = _pricing.merge_model_costs(groups)
@@ -954,7 +961,8 @@ def _scope_models_cost(con, where, args, covers=None):
     prov_of = {}
     for model, prov, *_ in groups:
         prov_of.setdefault(model, prov)
-    models = [{"model": k, "requests": v[0], "total": v[1], "cost_usd": per.get(k, 0.0),
+    models = [{"model": k, "requests": v[0], "total": v[1], "input": v[2], "cache_read": v[3],
+               "cost_usd": per.get(k, 0.0),
                "rates": _model_rates(k, prov_of.get(k, "")).get("rates")}
               for k, v in acc.items()]
     if covers is not None:   # 哨兵语义：空集（无落章 provider）也是有效口径，不跳过
@@ -1236,11 +1244,12 @@ def _report_stats(con, covers=frozenset()):
             if bk != b:
                 continue
             a = per.setdefault(model, {"model": model, "requests": 0, "input": 0,
-                                       "output": 0, "rated_output": 0,
+                                       "output": 0, "cache_read": 0, "rated_output": 0,
                                        "unrated_output": 0, "gen_ms": 0, "_pv": {}})
             a["requests"] += v[0]
             a["input"] += v[1]
             a["output"] += v[2]
+            a["cache_read"] += v[3]   # v264：每模型 cache_read（模型明细「缓存命中」列素材）
             a["rated_output"] += v[5]
             a["unrated_output"] += v[6]
             a["gen_ms"] += v[7]
@@ -1257,6 +1266,7 @@ def _report_stats(con, covers=frozenset()):
             prov = max(a["_pv"].items(), key=lambda kv: kv[1])[0]
             row = {"model": model, "provider": prov,
                    "requests": a["requests"], "input": a["input"], "output": a["output"],
+                   "cache_read": a["cache_read"],
                    "total": a["input"] + a["output"],
                    "tps": _rated_tps(a["rated_output"], a["gen_ms"]),
                    "rated_output": a["rated_output"], "unrated_output": a["unrated_output"]}

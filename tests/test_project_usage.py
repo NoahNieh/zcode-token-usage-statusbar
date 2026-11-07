@@ -170,6 +170,9 @@ class ProjectUsageAggTests(FixtureBase):
         self.assertEqual(len(pm["models"]), 2)   # 跨片按模型合并（每片 2 行 → 合并后仍 2）
         self.assertEqual([m["requests"] for m in pm["models"]], [300, 300])
         self.assertEqual([m["model"] for m in pm["models"]], ["model-a", "model-b"])   # 总量降序（model-a=300×15）
+        # v264：每模型 input/cache_read 跨片累加（usage() 夹具每行 input=60/cache_read=40）
+        self.assertEqual(pm["models"][0]["input"], 300 * 60)
+        self.assertEqual(pm["models"][0]["cache_read"], 300 * 40)
 
     def test_file_db_ttl_cache(self):
         # v177：缓存挂库文件身份（内存库不缓存）——命中省重扫（大库单项目聚合 ~40ms/次）、
