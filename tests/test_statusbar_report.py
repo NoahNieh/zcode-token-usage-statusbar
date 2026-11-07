@@ -150,6 +150,35 @@ class ReportStatsTests(ReportFixture):
         self.assertEqual(m["unrated_output"], 0)
         self.assertEqual(m["tps"], 200.0)               # 200/1s，900 不进任何速度口径
 
+    def test_range_totals_cross_model_aggregate(self):
+        """v262 totals：范围跨模型合计（tokens/次数/思考含辅助源与子代理）+ 主链加权
+        tps + started/last_at 极值；累计桶语义 today ⊂ d7 ⊂ d30（8 天前只进 d30）。"""
+        base = self.at(0)
+        self.insert(
+            # 今日 GLM：400 tok / 4s
+            self.row("r1", completed=base, started=base - 10_000, ft=base - 4_000, out=400, inp=50),
+            # 今日 gpt-x：推理前置（covers 空）→ 10s 窗口 → 40 t/s
+            self.row("r2", model="gpt-x", prov="relay:x", completed=base + 1000,
+                     started=base + 1000 - 10_000, ft=base + 1000 - 4_000, out=400, inp=60,
+                     reasoning=5_000),
+            # 今日辅助源：tokens/思考计入，速度不计
+            self.row("a1", qs="session_title", completed=base + 2000, started=base + 1000,
+                     out=999, inp=7, reasoning=11),
+            # 8 天前：只进 d30
+            self.row("r3", model="glm-4.7", completed=self.at(8), started=self.at(8) - 2_000,
+                     out=200, inp=20))
+        rep = zusage._report_stats(self.con)
+        t = rep["totals"]["today"]
+        self.assertEqual((t["requests"], t["input"], t["output"], t["total"]), (3, 117, 1799, 1916))
+        self.assertEqual(t["reasoning"], 5_011)
+        self.assertEqual(t["tps"], 57.1)   # 800/14s；辅助源 999 tokens 不进速度分母
+        self.assertEqual((t["started"], t["last_at"]), (base - 10_000, base + 2_000))
+        self.assertEqual(rep["totals"]["d7"]["requests"], 3)   # 8 天前行不进 d7
+        d30 = rep["totals"]["d30"]
+        self.assertEqual(d30["requests"], 4)
+        self.assertEqual(d30["tps"], 66.7)   # 1000/15s（今日 800/14s + r3 200/1s）
+        self.assertEqual(d30["started"], self.at(8) - 2_000)
+
     def test_range_bucketing_natural_days(self):
         """today/d7/d30 逐层包含；30 天前的窗口外行整行排除；days 恒 30 行含空日。"""
         self.insert(

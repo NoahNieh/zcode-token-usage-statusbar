@@ -413,3 +413,58 @@ test('速度 tooltip：宽度帽收窄标记（:has 640）+ 预估费用行与�
   assert.doesNotMatch(tips[0], /预估费用/);   // v215.1 用户规格：速度卡不含费用行与模型明细
   assert.doesNotMatch(tips[0], /rt-models/);
 });
+
+test('v262 会话/今日/项目统计卡「平均速率」弱化行：>0 渲染档色值、缺字段/零值整行不渲染', () => {
+  const h = harness(); setup(h);
+  /* 默认夹具：会话 avg_tps=0、today/project 无该字段（轻量行/旧远端快照形态）——
+   * 三卡都不渲染该行，不显假 0 */
+  h.window.__zusageUpdate(h.payload({}));
+  let tips = h.tips();
+  const tipOf = mark => tips.find(t => t && t.includes(mark));
+  assert.doesNotMatch(tipOf('zu-stat-tip--session'), /平均速率/);
+  assert.doesNotMatch(tipOf('zu-stat-tip--today'), /平均速率/);
+  assert.doesNotMatch(tipOf('zu-project-tip'), /平均速率/);
+  /* 字段齐备：弱化行（--sub 辅助行）档位色值 + t/s 单位，档类与条面同源。
+   * 注意 avg_tps>0 同时让速度格走 DB 回退分支（完成态主数字=会话均），tip 下标
+   * 整体后移——按内容标记定位，不依赖下标。 */
+  const p = h.payload({});
+  p.recent[0].avg_tps = 85.3;             // 70–150 流畅档 ok
+  p.today.avg_tps = 250;                  // 200–300 快速档 zu-sky
+  p.recent[0].project.avg_tps = 35;       // <40 低速档 hot
+  h.window.__zusageUpdate(p);
+  tips = h.tips();
+  const rowRe = (cls, val) =>
+    new RegExp('zu-stat-kpis--sub"><div class="zu-stat-kpi"><div class="zu-stat-k">平均速率</div>' +
+      '<div class="zu-stat-v"><span class="' + cls + '">' + val + '</span> <small>t/s</small>');
+  assert.match(tipOf('zu-stat-tip--session'), rowRe('ok', '85\.3'));
+  assert.match(tipOf('zu-stat-tip--today'), rowRe('zu-sky', '250'));
+  assert.match(tipOf('zu-project-tip'), rowRe('hot', '35'));
+});
+
+test('v262 模型明细「平均速率 t/s」列：带值档色渲染、无样本显 —、全缺省整列不渲染', () => {
+  const h = harness(); setup(h);
+  // 默认夹具 models 无 tps（旧快照形态）→ 各卡模型表不加列
+  h.window.__zusageUpdate(h.payload({}));
+  let tips = h.tips();
+  const tipOf = mark => tips.find(t => t && t.includes(mark));
+  assert.doesNotMatch(tipOf('zu-stat-tip--session'), /平均速率 t\/s/);
+  assert.doesNotMatch(tipOf('zu-stat-tip--today'), /平均速率 t\/s/);
+  assert.doesNotMatch(tipOf('zu-project-tip'), /平均速率 t\/s/);
+  // 带值：表头列出现，值按档位着色；无有效样本的模型显 —（tokens/次数照旧）
+  const p = h.payload({});
+  p.recent[0].models[0].tps = 123.4;      // GLM-5.3 → 70–150 流畅档 ok
+  p.recent[0].models[1].tps = 0;          // claude-opus-5-5 无有效样本 → —
+  p.today.models[0].tps = 45;             // 40–70 一般档 warm
+  p.recent[0].project.models[0].tps = 250; // 200–300 快速档 zu-sky
+  h.window.__zusageUpdate(p);
+  tips = h.tips();
+  const sess = tipOf('zu-stat-tip--session');
+  assert.match(sess, /<th>平均速率 t\/s<\/th>/);
+  assert.match(sess, /<td><span class="ok">123\.4<\/span><\/td><td>¥2\.84<\/td>/);
+  assert.match(sess, /<td>—<\/td><td>¥4\.26<\/td>/);
+  assert.match(tipOf('zu-stat-tip--today'), /<th>平均速率 t\/s<\/th>/);
+  assert.match(tipOf('zu-stat-tip--today'), /<span class="warm">45<\/span>/);
+  const pj = tipOf('zu-project-tip');
+  assert.match(pj, /<th>平均速率 t\/s<\/th>/);
+  assert.match(pj, /<span class="zu-sky">250<\/span>/);
+});

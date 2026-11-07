@@ -223,6 +223,7 @@ def _project_usage(con, sid, with_models=False):
     pname = pdir.rsplit("/", 1)[-1] if pdir else ""
 
     def run():
+        covers = _provider_first_token_covers(con)   # v262：生成窗口覆盖集与会话均同源（60s TTL 缓存）
         mains = [r[0] for r in con.execute(
             """select id from session where project_id=?
                and parent_id is null and substr(id,1,?)!='sess_subagent'
@@ -239,6 +240,8 @@ def _project_usage(con, sid, with_models=False):
         sessions = turns = requests = input_t = output_t = reasoning = 0
         cache_read = cache_write = total = tool_calls = retries = 0
         started = last_at = None
+        rated_out = gen_ms_sum = 0   # v262：项目平均速率跨分片累加 Σ有效输出/Σ生成窗口
+        model_rate = {}              # v262：每模型 [Σ有效输出, Σ生成窗口]（仅完整行需要）
         models_acc = {}
         cost_groups = []   # v202 预估费用分组（与 with_models 无关恒产出，轻量行项目格同款）
         for i in range(0, len(all_ids), 500):
@@ -271,6 +274,24 @@ def _project_usage(con, sid, with_models=False):
                 started = r[11]
             if r[12] is not None and (last_at is None or r[12] > last_at):
                 last_at = r[12]
+            # v262：项目平均速率——main_turn 行逐行按 _row_gen_ms 算生成窗口（与会话均
+            # 同口径），跨分片累加后出口 _rated_tps 一次折算；光标级 row_factory 兜底
+            # 本函数既有「con 可能没有 row_factory」防御口径。
+            cur = con.execute(
+                f"""select output_tokens, first_token_at, completed_at, started_at,
+                           reasoning_tokens, model_id, provider_id
+                    from model_usage where status='completed' and session_id in ({qm})
+                      and (query_source is null or query_source='main_turn')""", part)
+            cur.row_factory = sqlite3.Row
+            tps_rows = cur.fetchall()
+            tr = _turn_rate(tps_rows, covers)
+            rated_out += tr["rated_output"]
+            gen_ms_sum += tr["gen_ms"]
+            if with_models:   # v262：每模型平均速率跨分片累加（轻量行不带 models 不需要）
+                for mk, mv in _model_rate_map(tps_rows, covers).items():
+                    g = model_rate.setdefault(mk, [0, 0])
+                    g[0] += mv[0]
+                    g[1] += mv[1]
             # v202：模型分组查询从 with_models 分支提为恒跑（费用与模型明细同源一条 SQL），
             # 聚合到 (model_id, provider_id)——同模型不同 provider 牌价不同，费用分组计；
             # models_acc 仍只在 with_models 时累积（轻量行项目聚合不带 models，v163 契约不变）
@@ -302,6 +323,10 @@ def _project_usage(con, sid, with_models=False):
                 proj_cost = None   # 费用失败不拖垮项目聚合（可选增强字段口径）
         else:
             proj_cost = None
+        for m in models:   # v262：每模型平均速率（无有效样本省略；不随价表模块缺失消失）
+            g = model_rate.get(m["model"])
+            if g and g[1]:
+                m["tps"] = _rated_tps(g[0], g[1])
         models.sort(key=lambda m: -m["total"])
         return {
             "sessions": sessions, "turns": turns, "requests": requests,
@@ -313,6 +338,8 @@ def _project_usage(con, sid, with_models=False):
             "models": models,
             # None（价表模块缺失）→ JSON null，消费端按缺字段口径隐藏
             "cost_usd": proj_cost,
+            # v262 项目平均速率（main_turn 行加权，同会话均口径；0=无有效样本）
+            "avg_tps": _rated_tps(rated_out, gen_ms_sum),
         }
 
     dbkey = _db_cache_key(con)
@@ -833,10 +860,12 @@ def _model_cost_groups(con, where, args):
     return [(r[0] or "", r[1] or "", r[2], r[3], r[4], r[5]) for r in rows]
 
 
-def _session_models_cost(con, sid):
+def _session_models_cost(con, sid, covers=None):
     """模型明细 + 会话预估费用（v202）：单条 GROUP BY 查询同时产出计数/总量/费用。
     返回 (models 列表（按 total 降序，价表模块可用时带 cost_usd）, 会话总费用或 None)。
-    价表模块缺失（旧运行目录未部署 token_pricing.py）时退回 v163 结构、总费用 None。"""
+    价表模块缺失（旧运行目录未部署 token_pricing.py）时退回 v163 结构、总费用 None。
+    v262：covers 传集合（可为空集=无落章 provider）时附每模型平均速率 tps（main_turn
+    有效段加权，无样本省略字段）；None=不算速率（旧调用方）。"""
     acc = {}
     groups = []
     for r in con.execute(
@@ -851,6 +880,20 @@ def _session_models_cost(con, sid):
         a[1] += r[3]
         groups.append((model, r[1] or "", r[4], r[5], r[6], r[7]))
     models = [{"model": k, "requests": v[0], "total": v[1]} for k, v in acc.items()]
+    if covers is not None:   # 哨兵语义：空集（无落章 provider）也是有效口径，不跳过
+        try:
+            rate_map = _model_rate_map(con.execute(
+                """select output_tokens, first_token_at, completed_at, started_at,
+                          reasoning_tokens, model_id, provider_id
+                   from model_usage where session_id=? and status='completed'
+                     and (query_source is null or query_source='main_turn')""",
+                (sid,)).fetchall(), covers)
+            for m in models:
+                g = rate_map.get(m["model"])
+                if g and g[1]:
+                    m["tps"] = _rated_tps(g[0], g[1])
+        except sqlite3.Error:
+            pass   # 速率扫描失败不拖垮模型明细（同费用可选增强字段口径）
     if _pricing is None:
         models.sort(key=lambda m: -m["total"])
         return models, None
@@ -879,9 +922,11 @@ def _model_rates(model_id, provider_id):
         return {}
 
 
-def _scope_models_cost(con, where, args):
+def _scope_models_cost(con, where, args, covers=None):
     """按范围（本轮/今日）产出 (models 明细, 费用总额)，结构与 _session_models_cost 一致。
-    v202：本轮/今日 tooltip 的模型明细块（rt-models）与费用行共用这一条分组查询。"""
+    v202：本轮/今日 tooltip 的模型明细块（rt-models）与费用行共用这一条分组查询。
+    v262：covers 传集合（可为空集）时附每模型平均速率 tps（main_turn 有效段加权，
+    无样本省略字段；None=不算速率；速率扫描独立容错，失败仅省略 tps 不拖垮明细）。"""
     if _pricing is None:
         return None, None
     try:
@@ -912,6 +957,21 @@ def _scope_models_cost(con, where, args):
     models = [{"model": k, "requests": v[0], "total": v[1], "cost_usd": per.get(k, 0.0),
                "rates": _model_rates(k, prov_of.get(k, "")).get("rates")}
               for k, v in acc.items()]
+    if covers is not None:   # 哨兵语义：空集（无落章 provider）也是有效口径，不跳过
+        try:
+            rate_map = _model_rate_map(con.execute(
+                f"""select output_tokens, first_token_at, completed_at, started_at,
+                           reasoning_tokens, model_id, provider_id
+                    from model_usage where status='completed' and {where}
+                      and (query_source is null or query_source='main_turn')""",
+                args,
+            ).fetchall(), covers)
+            for m in models:
+                g = rate_map.get(m["model"])
+                if g and g[1]:
+                    m["tps"] = _rated_tps(g[0], g[1])
+        except Exception:
+            pass   # 速率扫描失败不拖垮模型明细（同费用可选增强字段口径）
     models.sort(key=lambda m: -m["total"])
     return models, total
 
@@ -1089,6 +1149,21 @@ def _rated_tps(tokens, gen_ms):
     return round(tokens / (gen_ms / 1000), 1) if gen_ms else 0
 
 
+def _model_rate_map(rows, covers=frozenset()):
+    """v262：按模型聚合有效生成段 {model_id: [Σ有效输出, Σ生成窗口]}——统计卡模型明细
+    的每模型平均速率素材（main_turn 行 _row_gen_ms 窗口 + 200ms–1h 有效段，口径同
+    avg_tps；tokens/次数含辅助源，速率仅 main_turn 行进分母）。"""
+    out = {}
+    for row in rows:
+        tokens = row["output_tokens"] or 0
+        gen_ms = _row_gen_ms(row, covers)
+        if tokens > 0 and gen_ms and _TPS_MIN_GEN_MS <= gen_ms < _TPS_MAX_GEN_MS:
+            g = out.setdefault(row["model_id"] or "", [0, 0])
+            g[0] += tokens
+            g[1] += gen_ms
+    return out
+
+
 _REPORT_RANGES = ("today", "d7", "d30")
 
 
@@ -1109,7 +1184,9 @@ def _report_stats(con, covers=frozenset()):
     闭区间（today=今日，d7=今日+前 6 天，d30=今日+前 29 天，同 daily_usage 语义）。
     出口按 model_id 合并、total 降序，provider 取请求数最多者展示；价表模块可用时带
     cost_usd/rates（缺失省略费用字段，token 照常输出）。sessions 复用 recent_sessions
-    并过滤子会话。"""
+    并过滤子会话。v262：出口追加 totals（范围汇总卡）——today/d7/d30 各一份跨模型
+    合计（requests/input/output/total/cache_read/cache_write/reasoning + 主链加权 tps
+    + started/last_at 极值），供 ⚙ 报表的今日/近7天/近30天汇总卡渲染。"""
     bounds = [_epoch_ms(_day_start(datetime.now() - timedelta(days=i)))
               for i in range(29, -1, -1)]
     rng, day = {}, {}   # (范围桶, model, prov) / (日桶, model, prov) → 累计数组
@@ -1126,12 +1203,19 @@ def _report_stats(con, covers=frozenset()):
         inp, out = r[2] or 0, r[3] or 0
         cr, cw = r[4] or 0, r[5] or 0
         for b in ((0, 1, 2) if di == 29 else ((1, 2) if di >= 23 else (2,))):
-            a = rng.setdefault((b, model, prov), [0, 0, 0, 0, 0, 0, 0, 0])
+            # v262 桶扩至 11 槽：a[8]=思考 tokens（与 tokens 同口径，含子代理）、
+            # a[9]/a[10]=范围内 started/completed 极值（范围汇总卡时间范围行）
+            a = rng.setdefault((b, model, prov), [0, 0, 0, 0, 0, 0, 0, 0, 0, None, None])
             a[0] += 1
             a[1] += inp
             a[2] += out
             a[3] += cr
             a[4] += cw
+            a[8] += r[9] or 0
+            if r[6] is not None and (a[9] is None or r[6] < a[9]):
+                a[9] = r[6]
+            if r[8] is not None and (a[10] is None or r[8] > a[10]):
+                a[10] = r[8]
             if r[10] is None or r[10] == "main_turn":
                 gen = _row_gen_ms(r, covers)
                 if out > 0 and gen and _TPS_MIN_GEN_MS <= gen < _TPS_MAX_GEN_MS:
@@ -1215,8 +1299,37 @@ def _report_stats(con, covers=frozenset()):
                      "total": (r[4] or 0) + (r[5] or 0), "last_at": r[7] or 0})
         if len(sess) >= 10:
             break
+    def _range_totals(i):
+        """v262 范围汇总（跨模型合计）：今日/近7天/近30天汇总卡的字段——tokens/次数/
+        缓存/思考跨模型求和（含子代理），tps=主链 Σrated ÷ Σgen（同会话均口径），
+        时间范围取范围内 started/completed 极值。"""
+        req = inp = out = cr = cw = rated = unrated = gen = rea = 0
+        started = last_at = None
+        for (bk, _m, _p), v in rng.items():
+            if bk != i:
+                continue
+            req += v[0]
+            inp += v[1]
+            out += v[2]
+            cr += v[3]
+            cw += v[4]
+            rated += v[5]
+            unrated += v[6]
+            gen += v[7]
+            rea += v[8]
+            if v[9] is not None and (started is None or v[9] < started):
+                started = v[9]
+            if v[10] is not None and (last_at is None or v[10] > last_at):
+                last_at = v[10]
+        return {"requests": req, "input": inp, "output": out, "total": inp + out,
+                "cache_read": cr, "cache_write": cw, "reasoning": rea,
+                "rated_output": rated, "unrated_output": unrated, "gen_ms": gen,
+                "tps": _rated_tps(rated, gen),
+                "started": started or 0, "last_at": last_at or 0}
+
     return {"models": {rid: _bucket_rows(i) for i, rid in enumerate(_REPORT_RANGES)},
-            "days": days, "sessions": sess}
+            "days": days, "sessions": sess,
+            "totals": {rid: _range_totals(i) for i, rid in enumerate(_REPORT_RANGES)}}
 
 
 def _speed_segments(con, sid, covers=frozenset()):
@@ -1393,7 +1506,7 @@ def _session_snapshot(con, sid, cfg):
         ).fetchall(), covers))
         # v202 本轮预估费用：按轮内 model_usage 行（turn_usage 无模型维度）计价
         turn_models, turn_cost = _scope_models_cost(
-            con, "session_id=? and turn_id=?", (sid, last["turn_id"]))
+            con, "session_id=? and turn_id=?", (sid, last["turn_id"]), covers)
         if turn_cost is not None:
             lt["cost_usd"] = turn_cost
         if turn_models:
@@ -1481,7 +1594,7 @@ def _session_snapshot(con, sid, cfg):
     # 模型明细（v163，v164 起全量不截断）：按模型分组的 completed 用量，tooltip
     # 「会话累计/项目累计」列出；轻量行不带（_light_snapshot 无此键，与 tools 瘦身同款）。
     # v202 起同一条 GROUP BY (model_id, provider_id) 查询顺带产出预估费用。
-    models, sess_cost = _session_models_cost(con, sid)
+    models, sess_cost = _session_models_cost(con, sid, covers)
     return {
         "sid": sid,
         "title": (srow["title"] if srow is not None else "") or "",
@@ -2280,6 +2393,7 @@ def snapshot(force_sid="", routes=None, serve_con=None):
         # 先置缺省：today 链失败进外层 except 时（con 存活但查询中途出错），字典组装
         # 不得因未绑定局部变量整帧崩溃（2026-11-07 用量报表 fail-soft 测试收编同款修复）
         today_detail, today_cost, stats = None, None, None
+        today_tps = 0   # v262 今日平均速率：同款先置缺省，今日链失败不整帧崩溃
         for fs in str(force_sid).split(","):
             fs = fs.strip()
             if fs and re.fullmatch(r"[A-Za-z0-9_-]+", fs) and fs not in force_sids:
@@ -2292,10 +2406,28 @@ def snapshot(force_sid="", routes=None, serve_con=None):
             # v202 今日预估费用+模型明细：同一条分组查询产出，2s 短缓存同 today
             def _today_detail():
                 models, cost = _scope_models_cost(
-                    con, "completed_at between ? and ?", (start_ms, end_ms))
+                    con, "completed_at between ? and ?", (start_ms, end_ms),
+                    _provider_first_token_covers(con))
                 return {"cost": cost, "models": models if models else []}
             today_detail = _cached_agg(("todaydetail", start_ms), _today_detail) if con else None
             today_cost = today_detail["cost"] if today_detail else None
+
+            # v262 今日平均速率：今日已完成 main_turn 行的加权平均（Σ有效输出 ÷ Σ生成窗口，
+            # _turn_rate 同款口径，与会话均/状态条 avg_tps 同源）；tokens/次数含子代理而
+            # 速度仅 main_turn 行进分母（同 v260 用量报表口径）。失败按 0 降级不拖垮整帧。
+            if con is not None:
+                def _today_tps_agg():
+                    return _turn_rate(con.execute(
+                        """select output_tokens, first_token_at, completed_at, started_at,
+                                  reasoning_tokens, model_id, provider_id
+                           from model_usage where status='completed' and completed_at between ? and ?
+                             and (query_source is null or query_source='main_turn')""",
+                        (start_ms, end_ms),
+                    ).fetchall(), _provider_first_token_covers(con))["tps"]
+                try:
+                    today_tps = _cached_agg(("todaytps", start_ms), _today_tps_agg)
+                except Exception:
+                    today_tps = 0
 
             # v260 用量报表聚合（可选增强字段 stats）：近 30 天单次扫描分桶；键带窗口
             # 起点跨零点自动失效。扫描实测百毫秒级，ttl 放宽到 5s（报表是慢变量，
@@ -2411,6 +2543,9 @@ def snapshot(force_sid="", routes=None, serve_con=None):
                 "cache_read": today[3], "total": today[4],
                 "reasoning": today[6], "retries": today[7], "cache_write": today[8],
                 "started": today[9] or 0, "last_at": today[10] or 0,
+                # v262 今日平均速率（main_turn 行加权，同会话均口径；0=无有效样本，
+                # 渲染端 >0 才渲染该行）
+                "avg_tps": today_tps,
                 # v202 预估费用+模型明细（可选增强字段；价表模块缺失时省略）
                 **({"cost_usd": today_cost} if today_cost is not None else {}),
                 **({"models": today_detail["models"]} if today_detail and today_detail["models"] else {}),

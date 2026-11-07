@@ -661,6 +661,139 @@ class SessionAvgTpsTests(unittest.TestCase):
         self.assertEqual(zusage._empty_snapshot("s", {"context_window": 200000})["avg_tps"], 0)
 
 
+class TodayAvgTpsTests(unittest.TestCase):
+    """v262：今日合计统计卡平均速率——快照 today.avg_tps。今日已完成 main_turn 行
+    加权平均（Σ有效输出 ÷ Σ生成窗口，_row_gen_ms 窗口 + 200ms–1h 有效段过滤），与
+    会话均同口径；tokens/次数含子代理与辅助源（_today_usage 不滤 query_source），
+    速度仅 main_turn 行进分母（真实库分布：子代理会话行 query_source='subagent'、
+    工作流派发行 'workflow_child'，同样不进）。无有效样本 0，渲染端 >0 才渲染。"""
+
+    def setUp(self):
+        zusage._COVERS_CACHE.update(ts=0.0, set=frozenset())
+        zusage._AGG_CACHE.clear()
+
+    def today(self, rows):
+        con = sqlite3.connect(":memory:")
+        self.addCleanup(con.close)
+        con.row_factory = sqlite3.Row
+        con.executescript(SCHEMA)
+        con.execute("insert into session (id, title) values ('s', 't')")
+        for r in rows:
+            con.execute("insert into model_usage values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", r)
+        proxy = mock.Mock(wraps=con)
+        proxy.close = mock.Mock()
+        with mock.patch.object(zusage, "connect", return_value=proxy), \
+             mock.patch.object(zusage, "load_config", return_value={"context_window": 200000}), \
+             mock.patch.object(zusage, "_day_start", return_value=zusage._day_start()), \
+             mock.patch.object(zusage, "_scan_session_ids", return_value=[]), \
+             mock.patch.object(zusage, "_remote_setup", return_value=None):
+            return zusage.snapshot(force_sid="s")["today"]
+
+    def row(self, rid, start, ft, completed, output, reasoning=0, source="main_turn",
+            status="completed", model="GLM-5.3"):
+        return (rid, "s", "t", source, "", "account:test", model, status, start, ft,
+                completed, completed - start, ft - start if ft else None,
+                10, output, reasoning, 0, 0, output + 10, 0, 0, 0)
+
+    def base(self):
+        return zusage._epoch_ms(zusage._day_start()) + 3_600_000   # 今日零点后 1h，恒在今日窗口
+
+    def test_weighted_mean_of_today_main_turns(self):
+        b = self.base()
+        t = self.today([
+            self.row("r1", b, b + 2_000, b + 7_000, 1000),                                     # 5000ms → 200 t/s
+            self.row("r2", b + 10_000, b + 12_000, b + 18_000, 240, reasoning=100),            # 上报思考：8000ms 窗口
+        ])
+        self.assertEqual(t["avg_tps"], 95.4)   # 1240 / 13s；算术平均 115.0 不是这个口径
+        self.assertEqual((t["requests"], t["output"]), (2, 1240))
+
+    def test_aux_and_subagent_rows_count_tokens_not_speed(self):
+        b = self.base()
+        t = self.today([
+            self.row("r1", b, b + 2_000, b + 7_000, 1000),
+            self.row("x1", b + 10_000, b + 12_000, b + 17_000, 99999, source="session_title"),
+            self.row("x2", b + 20_000, b + 22_000, b + 27_000, 88888, source="subagent"),
+            self.row("x3", b + 30_000, b + 32_000, b + 37_000, 77777, source="workflow_child"),
+        ])
+        self.assertEqual((t["requests"], t["output"]), (4, 1000 + 99999 + 88888 + 77777))
+        self.assertEqual(t["avg_tps"], 200.0)   # 速度分母只含 r1
+
+    def test_no_valid_sample_yields_zero(self):
+        b = self.base()
+        t = self.today([
+            self.row("f1", b, b + 1_000, b + 2_000, 1000, status="failed"),
+            self.row("x1", b + 10_000, b + 12_000, b + 17_000, 5000, source="session_title"),
+        ])
+        self.assertEqual(t["avg_tps"], 0)
+
+    def test_today_models_per_model_tps(self):
+        # v262：今日模型明细每模型平均速率（main_turn 有效段按模型聚合）；
+        # 辅助源 tokens 计入 models 的 tokens/次数、速率分母不含
+        b = self.base()
+        t = self.today([
+            self.row("r1", b, b + 2_000, b + 7_000, 1000),
+            self.row("r2", b + 10_000, b + 12_000, b + 18_000, 240, reasoning=100, model="glm-4.7"),
+            self.row("x1", b + 20_000, b + 22_000, b + 27_000, 99999, source="session_title"),
+        ])
+        tps = {m["model"]: m.get("tps") for m in t["models"]}
+        self.assertEqual(tps["GLM-5.3"], 200.0)
+        self.assertEqual(tps["glm-4.7"], 30.0)
+
+
+class ModelTpsTests(unittest.TestCase):
+    """v262：统计卡模型明细每模型平均速率——models 条目 tps（_model_rate_map 按模型
+    聚合 main_turn 有效段，_row_gen_ms 窗口 + 200ms–1h 过滤，口径同 avg_tps）；
+    tokens/次数含辅助源而速率分母不含；无有效样本的模型省略 tps 字段（渲染端显 "—"，
+    全缺省整列不渲染）。"""
+
+    def setUp(self):
+        zusage._COVERS_CACHE.update(ts=0.0, set=frozenset())
+
+    def con_with(self, rows):
+        con = sqlite3.connect(":memory:")
+        self.addCleanup(con.close)
+        con.row_factory = sqlite3.Row
+        con.executescript(SCHEMA)
+        con.execute("insert into session (id, title) values ('s', 't')")
+        for r in rows:
+            con.execute("insert into model_usage values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", r)
+        return con
+
+    def row(self, rid, start, ft, completed, output, model="GLM-5.3", reasoning=0,
+            source="main_turn", status="completed", turn="t1"):
+        return (rid, "s", turn, source, "", "account:test", model, status, start, ft,
+                completed, completed - start, ft - start if ft else None,
+                10, output, reasoning, 0, 0, output + 10, 0, 0, 0)
+
+    def test_session_models_per_model_tps(self):
+        con = self.con_with([
+            self.row("r1", 1_000_000, 1_002_000, 1_007_000, 1000),                      # GLM-5.3 200 t/s
+            self.row("a1", 1_010_000, 1_012_000, 1_017_000, 99999, source="session_title"),  # GLM-5.3 辅助行
+            self.row("r2", 1_020_000, 1_022_000, 1_028_000, 240, model="glm-4.7", reasoning=100),  # 8000ms → 30 t/s
+            self.row("a2", 1_030_000, 1_032_000, 1_037_000, 7777, model="qwen-max", source="compact"),  # 仅辅助
+        ])
+        tps = {m["model"]: m.get("tps")
+               for m in zusage._session_snapshot(con, "s", {"context_window": 200000})["models"]}
+        self.assertEqual(tps["GLM-5.3"], 200.0)   # 辅助行 tokens 计入、速率分母不含
+        self.assertEqual(tps["glm-4.7"], 30.0)
+        q = next(m for m in zusage._session_snapshot(con, "s", {"context_window": 200000})["models"]
+                 if m["model"] == "qwen-max")
+        self.assertNotIn("tps", q)                # 仅辅助源的模型无有效样本：省略字段
+
+    def test_turn_models_per_model_tps(self):
+        con = self.con_with([
+            self.row("r1", 1_000_000, 1_002_000, 1_007_000, 1000),
+            self.row("a1", 1_010_000, 1_012_000, 1_017_000, 99999, source="session_title"),  # 同轮辅助行
+            self.row("r2", 1_020_000, 1_022_000, 1_028_000, 240, model="glm-4.7", reasoning=100),
+        ])
+        lt = zusage._session_snapshot(con, "s", {"context_window": 200000})["last_turn"]
+        tps = {m["model"]: m.get("tps") for m in lt["models"]}
+        self.assertEqual(tps["GLM-5.3"], 200.0)
+        self.assertEqual(tps["glm-4.7"], 30.0)
+        glm = next(m for m in lt["models"] if m["model"] == "GLM-5.3")
+        self.assertEqual(glm["requests"], 2)      # 次数含辅助行（口径不变）
+
+
 class SpeedSegmentsTests(unittest.TestCase):
     """速度 tooltip 柱状图数据源：session 快照行 speed_segs——v250 起按轮（turn_id）聚合，
     最近 ≤10 轮已完成 main_turn 有效速度段（一次提问的全部请求合并为一柱）。轮速度 =

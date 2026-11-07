@@ -228,6 +228,78 @@ class ProjectUsageAggTests(FixtureBase):
         self.assertNotIn("models", light)
 
 
+class ProjectAvgTpsTests(FixtureBase):
+    """v262：项目累计统计卡平均速率——_project_usage 新增 avg_tps。项目全部会话的
+    completed main_turn 行加权平均（Σ有效输出 ÷ Σ生成窗口，跨 500/批分片累加后
+    _rated_tps 一次折算），与会话均同口径；子代理会话行 query_source='subagent'
+    （真实库分布实证）与辅助源不进速度分母，tokens/次数照旧计入。无有效样本 0。"""
+
+    def setUp(self):
+        zusage._COVERS_CACHE.update(ts=0.0, set=frozenset())
+
+    def rate_row(self, con, rid, sid, start, ft, completed, output, reasoning=0,
+                 source="main_turn", status="completed", model="GLM-5.3"):
+        con.execute(
+            "insert into model_usage (id, session_id, turn_id, query_source, provider_id,"
+            " model_id, status, started_at, first_token_at, completed_at, input_tokens,"
+            " output_tokens, reasoning_tokens, cache_read_input_tokens,"
+            " cache_creation_input_tokens, computed_total_tokens, tool_call_count, retry_count)"
+            " values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (rid, sid, "t-" + rid, source, "account:test", model, status, start,
+             ft, completed, 10, output, reasoning, 0, 0, output + 10, 0, 0))
+
+    def test_weighted_mean_across_sessions_excl_subagent_rows(self):
+        con = self.fixture()
+        self.sess(con, "m1")
+        self.sess(con, "m2")
+        self.sess(con, "sess_subagent_x", parent="m1")
+        self.rate_row(con, "r1", "m1", 1_000_000, 1_002_000, 1_007_000, 1000)               # 5000ms → 200 t/s
+        self.rate_row(con, "r2", "m2", 1_010_000, 1_012_000, 1_018_000, 240, reasoning=100)  # 上报思考：8000ms 窗口
+        self.rate_row(con, "x1", "sess_subagent_x", 1_020_000, 1_022_000, 1_027_000, 99999,
+                      source="subagent")   # 子代理会话行不进速度分母（qs='subagent'，同报表夹具）
+        p = zusage._project_usage(con, "m1")
+        self.assertEqual(p["avg_tps"], 95.4)   # 1240 / 13s 加权；算术平均不是这个口径
+        self.assertEqual(p["requests"], 3)     # tokens/次数仍含子代理会话
+
+    def test_chunked_shards_accumulate(self):
+        # 跨片累加：>500 会话分片，每会话一行有效段，Σ输出/Σ窗口跨片相加不重不漏
+        con = self.fixture()
+        for i in range(600):
+            sid = f"m{i:03d}"
+            self.sess(con, sid)
+            self.rate_row(con, f"r{i}", sid, 1_000_000 + i * 100_000,
+                          1_000_000 + i * 100_000 + 2_000,
+                          1_000_000 + i * 100_000 + 7_000, 500)   # 每行 500 tok / 5s
+        self.assertEqual(zusage._project_usage(con, "m000")["avg_tps"], 100.0)
+
+    def test_no_valid_sample_yields_zero(self):
+        con = self.fixture()
+        self.sess(con, "m1")
+        self.rate_row(con, "r1", "m1", 1_000_000, None, 1_007_000, 1000)     # 缺首字不进分母
+        self.rate_row(con, "r2", "m1", 1_010_000, 1_012_000, 1_017_000, 5000,
+                      source="session_title")                                 # 辅助源不进分母
+        self.assertEqual(zusage._project_usage(con, "m1")["avg_tps"], 0)
+
+    def test_models_per_model_tps_full_rows_only(self):
+        # v262：with_models 时每模型平均速率（按模型聚合 main_turn 有效段）；
+        # 仅辅助源的模型省略 tps 字段（渲染端显 "—"）；轻量行不带 models 无此字段。
+        con = self.fixture()
+        self.sess(con, "m1")
+        self.sess(con, "m2")
+        self.rate_row(con, "r1", "m1", 1_000_000, 1_002_000, 1_007_000, 1000)                # 200 t/s
+        self.rate_row(con, "r2", "m2", 1_010_000, 1_012_000, 1_018_000, 240,
+                      reasoning=100, model="glm-4.7")                                        # 8000ms → 30 t/s
+        self.rate_row(con, "a1", "m1", 1_020_000, 1_022_000, 1_027_000, 99999,
+                      source="session_title", model="qwen-max")                              # 仅辅助：无 tps
+        p = zusage._project_usage(con, "m1", with_models=True)
+        tps = {m["model"]: m.get("tps") for m in p["models"]}
+        self.assertEqual(tps["GLM-5.3"], 200.0)
+        self.assertEqual(tps["glm-4.7"], 30.0)
+        q = next(m for m in p["models"] if m["model"] == "qwen-max")
+        self.assertNotIn("tps", q)
+        self.assertEqual(zusage._project_usage(con, "m1")["models"], [])   # 轻量行不带 models
+
+
 class ProjectSnapshotInjectTests(FixtureBase):
     def snapshot_with(self, con, force_sid, routes=None):
         proxy = mock.Mock(wraps=con)
