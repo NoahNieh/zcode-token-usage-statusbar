@@ -12,6 +12,7 @@ import importlib.util
 import sqlite3
 import sys
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -258,6 +259,95 @@ class ReportStatsTests(ReportFixture):
         self.assertEqual(sess[0]["sid"], "main00")      # 按最后完成时间降序
         self.assertEqual(sess[0]["title"], "标题0")
         self.assertEqual(sess[0]["total"], 11)          # in+out
+
+
+class ReportRangeStatsTests(ReportFixture):
+    """v265 自选范围/单日聚合（zusage._report_range_stats / _parse_range_dates）。"""
+
+    def test_stats_days_carry_iso_date(self):
+        """v265：快照报表日行附 ISO 本地日期，供趋势柱点击选日。"""
+        self.insert(self.row("r1", completed=self.at(0), out=100, inp=10))
+        rep = zusage._report_stats(self.con)
+        today = zusage._day_start().strftime("%Y-%m-%d")
+        self.assertEqual(rep["days"][-1]["date"], today)
+        self.assertEqual(len(rep["days"]), 30)
+        for i, d in enumerate(rep["days"]):
+            self.assertRegex(d["date"], r"^\d{4}-\d{2}-\d{2}$")
+            self.assertEqual(d["date"],
+                             (zusage._day_start() - timedelta(days=29 - i)).strftime("%Y-%m-%d"))
+
+    def test_range_arbitrary_window_closed_boundaries(self):
+        """任意范围（100~40 天前）：起止当天闭区间、范围外排除、空日补行。"""
+        now = datetime.now()
+        start = zusage._day_start(now - timedelta(days=100))
+        end = zusage._day_start(now - timedelta(days=40))
+        start_ms, end_ms = zusage._epoch_ms(start), zusage._epoch_ms(end + timedelta(days=1))
+        self.insert(
+            self.row("in_start", completed=start_ms, started=start_ms - 2000,
+                     ft=start_ms - 1000, out=10, inp=1),
+            self.row("in_end", completed=end_ms - 1, started=end_ms - 3000,
+                     ft=end_ms - 2000, out=20, inp=2),
+            self.row("before", completed=start_ms - 1, started=start_ms - 3000,
+                     ft=start_ms - 2000, out=99, inp=99),
+            self.row("after", completed=end_ms, started=end_ms - 2000,
+                     ft=end_ms - 1000, out=88, inp=88),
+        )
+        rep = zusage._report_range_stats(self.con, start, end)
+        self.assertEqual(rep["from"], start.strftime("%Y-%m-%d"))
+        self.assertEqual(rep["to"], end.strftime("%Y-%m-%d"))
+        self.assertEqual(len(rep["days"]), 61)
+        self.assertEqual((rep["totals"]["requests"], rep["totals"]["total"]), (2, 33))
+        self.assertEqual(rep["totals"]["started"], start_ms - 2000)
+        self.assertEqual(rep["totals"]["last_at"], end_ms - 1)
+        self.assertEqual(rep["days"][0]["date"], start.strftime("%Y-%m-%d"))
+        self.assertEqual(rep["days"][-1]["date"], end.strftime("%Y-%m-%d"))
+        self.assertEqual((rep["days"][0]["requests"], rep["days"][-1]["requests"]), (1, 1))
+        self.assertEqual(sum(d["requests"] for d in rep["days"]), 2)
+        self.assertEqual(sum(1 for d in rep["days"] if d["requests"] == 0), 59)
+        self.assertEqual([m["requests"] for m in rep["models"]], [2])
+
+    def test_range_single_day_tokens_subagent_speed_window(self):
+        """单日：days 恒 1 行；子代理计 tokens/次数但不进速度分母。"""
+        base = self.at(0)
+        self.insert(
+            self.row("main", completed=base, started=base - 5000, ft=base - 4000,
+                     out=400, inp=40),
+            self.row("sub", qs="subagent", completed=base + 1000,
+                     started=base + 1000 - 3000, ft=base + 1000 - 1000, out=900, inp=90),
+        )
+        day = zusage._day_start().date()
+        rep = zusage._report_range_stats(
+            self.con, zusage._day_start(), zusage._day_start())
+        self.assertEqual(len(rep["days"]), 1)
+        self.assertEqual(rep["days"][0]["date"], day.strftime("%Y-%m-%d"))
+        self.assertEqual((rep["totals"]["requests"], rep["totals"]["output"]), (2, 1300))
+        self.assertEqual(rep["totals"]["rated_output"], 400)
+        self.assertEqual(rep["totals"]["tps"], 100.0)          # 400/4s，子代理 900 不进分母
+        self.assertEqual(rep["models"][0]["tps"], 100.0)
+
+    def test_range_pricing_missing_omits_cost(self):
+        """价表模块缺失：范围模型与日行都不带费用字段，token/速度照常。"""
+        self.insert(self.row("r1", completed=self.at(0), out=100, inp=10))
+        with mock.patch.object(zusage, "_pricing", None):
+            rep = zusage._report_range_stats(
+                self.con, zusage._day_start(), zusage._day_start())
+        self.assertNotIn("cost_usd", rep["models"][0])
+        self.assertNotIn("cost_usd", rep["days"][0])
+        self.assertEqual(rep["totals"]["total"], 110)
+
+    def test_parse_range_dates_strict(self):
+        """严格零填充、日历合法性、start<=end、≤366 天（含首尾）。"""
+        start, end = zusage._parse_range_dates(["2024-02-29", "2024-03-01"])
+        self.assertEqual((start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")),
+                         ("2024-02-29", "2024-03-01"))
+        # 366 天（含首尾）允许，367 天拒绝
+        ok = zusage._parse_range_dates(["2024-01-01", "2024-12-31"])
+        self.assertEqual((ok[1] - ok[0]).days + 1, 366)
+        for bad in (["2026-1-1", "2026-01-02"], ["2026-02-30", "2026-03-01"],
+                    ["2026-02-02", "2026-01-01"], ["2024-01-01", "2025-01-01"],
+                    ["2026-01-01"]):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                zusage._parse_range_dates(bad)
 
 
 class ReportCachedAggTests(unittest.TestCase):

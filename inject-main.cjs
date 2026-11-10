@@ -158,6 +158,19 @@ const windowQuotaSelections = new Map();   // webContents.id → {paneId: {sid, 
 /* 本窗是否出现过任何远端工作区/任务证据：issue #40 的无桥本地兜底只在确认
  * “本窗只能查本地”时启用，有远端证据时 overlay 仍 fail-closed。 */
 const remoteEvidence = new Map();
+/* v266：每窗口附属状态（mine / scope_bindings / remote_evidence）的指纹。只有与最近一次
+ * 整包推送时完全一致，本地请求才带 same_ok——服务端回 {"same":1} 时泵不重推，这些随窗口
+ * 注入的归属字段若已变化就会滞留旧值（远端分栏 fail-closed 归属尤其不能迟到）。 */
+function pushStateStamp() {
+  const parts = [];
+  for (const [id, sid] of activeSid) parts.push(`m${id}=${sid}`);
+  for (const [id, val] of remoteEvidence) parts.push(`e${id}=${val ? 1 : 0}`);
+  for (const [id, b] of scopeBindings) {
+    parts.push(`b${id}=` + Object.keys(b || {}).sort().map((k) => `${k}:${b[k]}`).join(","));
+  }
+  return parts.sort().join("|");
+}
+let lastPushedPushStamp = null;   // handlePayload 整包推送后刷新；null = 尚未推过
 /* 可信远端身份白名单：ssh（3.15.x）/ wsl、docker（直接传输）/ server（v3.16 起所有传输
  * 连接握手后统一升级为 remote:server:<serverId>:<path>，remote:wsl: 等只留作 legacy）。
  * 前缀只决定“是否远端”，路由键是整串身份；未知前缀仍 fail-closed 按本地处理。 */
@@ -362,6 +375,7 @@ function handlePayload(payload) {
   if (disabled) clearRemoteRecovery(); // 关闭期间返回的迟到成功快照也不能重建粘性标记。
   else lastHadRemote = keys.some((key) => isRemoteSid(key) || pendingSids.has(key));
   for (const wc of webContents.getAllWebContents()) pushOnce(wc, payload);
+  lastPushedPushStamp = pushStateStamp();   // v266：本轮整包已带出当前附属状态
   // 定位诊断：每 ~15 次拉取收集每个窗口各自的 __zusageDiag，附加泵侧证据后写 diag-<n>.json
   // （多窗口互不覆盖）。config.diag 显式 false 关闭（省常驻 executeJavaScript + 同步写盘，
   // 排障时设回 true 或删键即恢复，缺省开）。
@@ -495,7 +509,18 @@ function runQuery(request) {
     settled = true;
     busy = false;
     const keys = requestKeys(request);
-    if (payload && !payload.error) {
+    if (payload && payload.same === 1) {
+      /* v266：服务端判定相关表未变，只回 {"same":1}——不重推整包。若在途期间每窗口
+       * 附属状态变了（会话切换/远端证据），用上一份快照补推一次（不重查库），
+       * 保证 mine/scope_bindings 归属不滞留。 */
+      if (pushStateStamp() !== lastPushedPushStamp && lastGoodPayload && !shuttingDown && hasWindows()) {
+        /* 与额度补推同款：lastGoodPayload 是注入 quota 前的原始包，补推时重新挂当前额度视图。 */
+        const replay = (quotaClient && quotaDataEnabled())
+          ? Object.assign({}, lastGoodPayload, { quota: quotaClient.view() }) : lastGoodPayload;
+        for (const wc of webContents.getAllWebContents()) pushOnce(wc, replay);
+        lastPushedPushStamp = pushStateStamp();
+      }
+    } else if (payload && !payload.error) {
       if (!shuttingDown && hasWindows()) handlePayload(payload);
     } else if (remoteDisabled()) {
       clearRemoteRecovery();
@@ -681,6 +706,11 @@ function maybeSpawn() {
       });
       request.sids.sort();
       request.scopes.sort((a, b) => scopeKey(a.sid, a.workspaceIdentity).localeCompare(scopeKey(b.sid, b.workspaceIdentity)));
+      /* v266：本地请求带 same_ok——服务端在相关表未变时只回 {"same":1}，泵跳过 153KB
+       * 整包重推。带 scopes 的远端请求不发该标记（远端数据可独立变化，服务端侧也不缓存）。
+       * 会话集变化会让请求行本身变化，服务端自然重算；只有附属状态变化时由 done()
+       * 用上一份快照补推一次。 */
+      if (!request.scopes.length) request.same_ok = 1;
       const key = JSON.stringify(request);
       const src = sourceStamp();
       const keys = requestKeys(request);
@@ -1278,6 +1308,52 @@ function deliverPluginRequest(wc, requestId, result) {
   const js = "window.__zusagePluginResult && window.__zusagePluginResult(" + JSON.stringify(Object.assign({ id: requestId }, result || {})) + ")";
   return wc.executeJavaScript(js, true).then(() => true).catch(() => false);
 }
+/* ---------- v265 用量报表「自选范围」按需查询 ----------
+ * 渲染端 pluginRequest("report-range", {from,to}) → 一次性 execFile zusage.py
+ * report-range FROM TO：低频用户动作，不占常驻泵 stdin，也不把任意范围结果塞进
+ * 每 1.5s 推送的快照。日期/跨度两侧都校验（严格 YYYY-MM-DD、start<=end、≤366 天，
+ * 含首尾）；只读本地库，不涉及远端。 */
+const REPORT_RANGE_MAX_DAYS = 366;
+function validReportDate(s) {
+  if (typeof s !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const y = +s.slice(0, 4), m = +s.slice(5, 7), d = +s.slice(8, 10);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+function validReportRange(from, to) {
+  if (!validReportDate(from) || !validReportDate(to)) return false;
+  const ms = Date.UTC(+to.slice(0, 4), +to.slice(5, 7) - 1, +to.slice(8, 10)) -
+    Date.UTC(+from.slice(0, 4), +from.slice(5, 7) - 1, +from.slice(8, 10));
+  return ms >= 0 && ms / 86400000 + 1 <= REPORT_RANGE_MAX_DAYS;
+}
+function queryReportRange(req, wc) {
+  const from = req && typeof req.from === "string" ? req.from : "";
+  const to = req && typeof req.to === "string" ? req.to : "";
+  if (!validReportRange(from, to)) {
+    deliverPluginRequest(wc, req && req.requestId, { ok: false, error: "invalid-range" });
+    return;
+  }
+  execFile(readCfgCached().python_path, [ZUSAGE, "report-range", from, to],
+    { windowsHide: true, timeout: 15000, maxBuffer: 16 * 1024 * 1024 },
+    (error, stdout) => {
+      let payload = null;
+      try { payload = JSON.parse(String(stdout || "").trim()); } catch (e) { }
+      /* 旧 PL 或缺库时 stdout 可能是人类文案：JSON 解析/回显校验不过一律按查询失败，
+         渲染端据此给中性提示，不把原始输出或路径透到 UI。 */
+      if (!payload || typeof payload !== "object" || payload.error ||
+          payload.from !== from || payload.to !== to) {
+        if (error) LOG("report range query failed:", error.message);
+        deliverPluginRequest(wc, req.requestId, { ok: false, error: "query-failed" });
+        return;
+      }
+      deliverPluginRequest(wc, req.requestId, {
+        ok: true, from: payload.from, to: payload.to,
+        models: Array.isArray(payload.models) ? payload.models : [],
+        totals: payload.totals && typeof payload.totals === "object" ? payload.totals : null,
+        days: Array.isArray(payload.days) ? payload.days : [],
+      });
+    });
+}
 async function setAnswerRateLine(enabled, wc, requestId) {
   try {
     const { updateConfig } = require("./plugin-updater.cjs");
@@ -1794,6 +1870,8 @@ async function pollPluginRequests() {
           deliverPluginRequest(wc, req.requestId, started ? { ok: true, pending: true } : { ok: false, error: "quota query already running or unavailable" });
         } else if (req && req.action === "turn-text" && typeof req.sid === "string") {
           queryTurnText(req.sid, wc, req.cn === 0, req.forceKmb === true, req.unitEpoch);
+        } else if (req && req.action === "report-range") {   // v265：⚙ 用量报表自选范围（一次性 execFile，低频）
+          queryReportRange(req, wc);
         } else if (req && req.action === "git-refresh") {   // v96：Git chip 点击 / 快照后节流：立即重查全部已关注路径
           gitTick(true, req.requestId, wc, req.path).catch(() => { });
         } else if (req && req.action === "relaunch") {   // v172：⚙ 更新页「重启 ZCode」按钮（浮层已二次确认）
@@ -1923,6 +2001,7 @@ if (typeof module === "object" && module && module.exports) {
     disposeQuotaSubsystem,   // v258：退出清理测试入口（watcher 关闭断言）
     quotaWatcherCount: () => quotaWatchers.length,
     hotModuleState: () => ({ mtimes: { ...hotModuleMtimes }, busy: hotMainBusy, hashes: { ...loadedHashes } }),
+    queryReportRange, validReportRange, pollPluginRequests,   // v265：报表自选范围测试入口
   };
 }
 

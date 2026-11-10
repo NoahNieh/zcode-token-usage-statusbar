@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """ZCode token 用量查询（只读访问 ~/.zcode/cli/db/db.sqlite）。
 
-既可作 CLI（python zusage.py [now|today|days N|sessions [N]|models [days]|workspace 关键词|session id前缀|watch [sec]]），
+既可作 CLI（python zusage.py [now|today|days N|sessions [N]|models [days]|workspace 关键词|session id前缀|watch [sec]|report-range FROM TO]），
 也可被 usage_mcp.py import 为查询库。
 """
 import hashlib
@@ -1183,105 +1183,126 @@ def _report_day_index(bounds, completed_ms):
     return min(di, len(bounds) - 1)
 
 
-def _report_stats(con, covers=frozenset()):
-    """用量报表聚合（快照可选字段 stats，仅桌面链，v260）：近 30 天 completed 行
-    单次扫描分桶。范围桶 today/d7/d30 × (model_id, provider_id)：全部行累计
-    tokens/次数（与今日合计、models 报表同口径，含子代理），速度仅 main_turn 行按
-    _row_gen_ms 窗口（200ms–1h 有效段）累计——与状态条会话均同口径，辅助 query_source
-    与子代理行不进速度分母。日桶 × (model, provider) 供每日费用。范围/日均本地自然日
-    闭区间（today=今日，d7=今日+前 6 天，d30=今日+前 29 天，同 daily_usage 语义）。
-    出口按 model_id 合并、total 降序，provider 取请求数最多者展示；价表模块可用时带
-    cost_usd/rates（缺失省略费用字段，token 照常输出）。sessions 复用 recent_sessions
-    并过滤子会话。v262：出口追加 totals（范围汇总卡）——today/d7/d30 各一份跨模型
-    合计（requests/input/output/total/cache_read/cache_write/reasoning + 主链加权 tps
-    + started/last_at 极值），供 ⚙ 报表的今日/近7天/近30天汇总卡渲染。"""
-    bounds = [_epoch_ms(_day_start(datetime.now() - timedelta(days=i)))
-              for i in range(29, -1, -1)]
-    rng, day = {}, {}   # (范围桶, model, prov) / (日桶, model, prov) → 累计数组
-    for r in con.execute(
-            """select model_id, provider_id, input_tokens, output_tokens,
-                      cache_read_input_tokens, cache_creation_input_tokens,
-                      started_at, first_token_at, completed_at, reasoning_tokens, query_source
-               from model_usage
-               where status='completed' and completed_at >= ?""", (bounds[0],)):
-        di = _report_day_index(bounds, r[8] or 0)
-        if di < 0:
-            continue
-        model, prov = r[0] or "", r[1] or ""
-        inp, out = r[2] or 0, r[3] or 0
-        cr, cw = r[4] or 0, r[5] or 0
-        for b in ((0, 1, 2) if di == 29 else ((1, 2) if di >= 23 else (2,))):
-            # v262 桶扩至 11 槽：a[8]=思考 tokens（与 tokens 同口径，含子代理）、
-            # a[9]/a[10]=范围内 started/completed 极值（范围汇总卡时间范围行）
-            a = rng.setdefault((b, model, prov), [0, 0, 0, 0, 0, 0, 0, 0, 0, None, None])
-            a[0] += 1
-            a[1] += inp
-            a[2] += out
-            a[3] += cr
-            a[4] += cw
-            a[8] += r[9] or 0
-            if r[6] is not None and (a[9] is None or r[6] < a[9]):
-                a[9] = r[6]
-            if r[8] is not None and (a[10] is None or r[8] > a[10]):
-                a[10] = r[8]
-            if r[10] is None or r[10] == "main_turn":
-                gen = _row_gen_ms(r, covers)
-                if out > 0 and gen and _TPS_MIN_GEN_MS <= gen < _TPS_MAX_GEN_MS:
-                    a[5] += out
-                    a[7] += gen
-                else:
-                    a[6] += out
-        d = day.setdefault((di, model, prov), [0, 0, 0, 0, 0, 0])
-        d[0] += 1
-        d[1] += inp
-        d[2] += out
-        d[3] += cr
-        d[4] += cw
+def _report_bucket_add(a, r, covers):
+    """一行 completed 请求累加进报表 11 槽桶（v262 口径，v265 提为共享函数）：
+    0 请求数 / 1 input / 2 output / 3 cache_read / 4 cache_write / 5 rated_output /
+    6 unrated_output / 7 gen_ms / 8 reasoning / 9 started 最小 / 10 completed 最大。
+    速度仅 main_turn（query_source 为空视同主链）且 200ms–1h 有效段进分母，
+    辅助 query_source 与子代理行不进速度口径。"""
+    inp, out = r["input_tokens"] or 0, r["output_tokens"] or 0
+    a[0] += 1
+    a[1] += inp
+    a[2] += out
+    a[3] += r["cache_read_input_tokens"] or 0
+    a[4] += r["cache_creation_input_tokens"] or 0
+    a[8] += r["reasoning_tokens"] or 0
+    started, completed = r["started_at"], r["completed_at"]
+    if started is not None and (a[9] is None or started < a[9]):
+        a[9] = started
+    if completed is not None and (a[10] is None or completed > a[10]):
+        a[10] = completed
+    if r["query_source"] is None or r["query_source"] == "main_turn":
+        gen = _row_gen_ms(r, covers)
+        if out > 0 and gen and _TPS_MIN_GEN_MS <= gen < _TPS_MAX_GEN_MS:
+            a[5] += out
+            a[7] += gen
+        else:
+            a[6] += out
 
-    def _bucket_rows(b):
-        per, groups = {}, []
-        for (bk, model, prov), v in rng.items():
-            if bk != b:
-                continue
-            a = per.setdefault(model, {"model": model, "requests": 0, "input": 0,
-                                       "output": 0, "cache_read": 0, "rated_output": 0,
-                                       "unrated_output": 0, "gen_ms": 0, "_pv": {}})
-            a["requests"] += v[0]
-            a["input"] += v[1]
-            a["output"] += v[2]
-            a["cache_read"] += v[3]   # v264：每模型 cache_read（模型明细「缓存命中」列素材）
-            a["rated_output"] += v[5]
-            a["unrated_output"] += v[6]
-            a["gen_ms"] += v[7]
-            a["_pv"][prov] = a["_pv"].get(prov, 0) + v[0]
-            groups.append((model, prov, v[1], v[2], v[3], v[4]))
-        per_cost = {}
-        if _pricing is not None and groups:
-            try:
-                _, per_cost = _pricing.merge_model_costs(groups)
-            except Exception:
-                per_cost = {}
-        rows = []
-        for model, a in per.items():
-            prov = max(a["_pv"].items(), key=lambda kv: kv[1])[0]
-            row = {"model": model, "provider": prov,
-                   "requests": a["requests"], "input": a["input"], "output": a["output"],
-                   "cache_read": a["cache_read"],
-                   "total": a["input"] + a["output"],
-                   "tps": _rated_tps(a["rated_output"], a["gen_ms"]),
-                   "rated_output": a["rated_output"], "unrated_output": a["unrated_output"]}
-            if _pricing is not None:
-                if model in per_cost:
-                    row["cost_usd"] = per_cost[model]
-                row["rates"] = _model_rates(model, prov).get("rates")
-            rows.append(row)
-        rows.sort(key=lambda m: -m["total"])
-        return rows
 
+def _report_day_add(d, r):
+    """一行 completed 请求累加进日桶 6 槽（请求/输入/输出/缓存读/缓存写；日行只用于
+    趋势与每日费用，不含速度）。"""
+    d[0] += 1
+    d[1] += r["input_tokens"] or 0
+    d[2] += r["output_tokens"] or 0
+    d[3] += r["cache_read_input_tokens"] or 0
+    d[4] += r["cache_creation_input_tokens"] or 0
+
+
+def _report_model_rows(buckets):
+    """范围模型行（v265 从 _report_stats 内闭包提出）：buckets 为 (model, provider,
+    11 槽数组) 可迭代；同模型跨 provider 合并，provider 取请求数最多者，total 降序。
+    价表模块可用时带 cost_usd/rates，缺失省略费用字段、token 照常输出。"""
+    per, groups = {}, []
+    for model, prov, v in buckets:
+        a = per.setdefault(model, {"model": model, "requests": 0, "input": 0,
+                                   "output": 0, "cache_read": 0, "rated_output": 0,
+                                   "unrated_output": 0, "gen_ms": 0, "_pv": {}})
+        a["requests"] += v[0]
+        a["input"] += v[1]
+        a["output"] += v[2]
+        a["cache_read"] += v[3]   # v264：每模型 cache_read（模型明细「缓存命中」列素材）
+        a["rated_output"] += v[5]
+        a["unrated_output"] += v[6]
+        a["gen_ms"] += v[7]
+        a["_pv"][prov] = a["_pv"].get(prov, 0) + v[0]
+        groups.append((model, prov, v[1], v[2], v[3], v[4]))
+    per_cost = {}
+    if _pricing is not None and groups:
+        try:
+            _, per_cost = _pricing.merge_model_costs(groups)
+        except Exception:
+            per_cost = {}
+    rows = []
+    for model, a in per.items():
+        prov = max(a["_pv"].items(), key=lambda kv: kv[1])[0]
+        row = {"model": model, "provider": prov,
+               "requests": a["requests"], "input": a["input"], "output": a["output"],
+               "cache_read": a["cache_read"],
+               "total": a["input"] + a["output"],
+               "tps": _rated_tps(a["rated_output"], a["gen_ms"]),
+               "rated_output": a["rated_output"], "unrated_output": a["unrated_output"]}
+        if _pricing is not None:
+            if model in per_cost:
+                row["cost_usd"] = per_cost[model]
+            row["rates"] = _model_rates(model, prov).get("rates")
+        rows.append(row)
+    rows.sort(key=lambda m: -m["total"])
+    return rows
+
+
+def _report_totals(buckets):
+    """范围汇总（v265 从 _report_stats 内闭包提出）：跨模型合计 + 主链加权 tps +
+    started/last_at 极值；buckets 同 _report_model_rows。"""
+    req = inp = out = cr = cw = rated = unrated = gen = rea = 0
+    started = last_at = None
+    for _model, _prov, v in buckets:
+        req += v[0]
+        inp += v[1]
+        out += v[2]
+        cr += v[3]
+        cw += v[4]
+        rated += v[5]
+        unrated += v[6]
+        gen += v[7]
+        rea += v[8]
+        if v[9] is not None and (started is None or v[9] < started):
+            started = v[9]
+        if v[10] is not None and (last_at is None or v[10] > last_at):
+            last_at = v[10]
+    return {"requests": req, "input": inp, "output": out, "total": inp + out,
+            "cache_read": cr, "cache_write": cw, "reasoning": rea,
+            "rated_output": rated, "unrated_output": unrated, "gen_ms": gen,
+            "tps": _rated_tps(rated, gen),
+            "started": started or 0, "last_at": last_at or 0}
+
+
+def _report_day_labels(bounds):
+    """日零点毫秒列表 → [(ISO 日期, 展示标签)]；展示标签保持 %m-%d %a 形状。"""
+    out = []
+    for ms in bounds:
+        dt = datetime.fromtimestamp(ms / 1000)
+        out.append((dt.strftime("%Y-%m-%d"), dt.strftime("%m-%d %a")))
+    return out
+
+
+def _report_day_rows(day, labels):
+    """日桶 → 每日趋势行（v265：附 ISO date 供趋势柱点击选日；费用随价表可选）。
+    day: {(日下标, model, provider): 6 槽}。"""
     days = []
-    for di in range(30):
-        label = datetime.fromtimestamp(bounds[di] / 1000).strftime("%m-%d %a")
-        row = {"d": label, "requests": 0, "input": 0, "output": 0, "total": 0}
+    for di, (iso, label) in enumerate(labels):
+        row = {"d": label, "date": iso, "requests": 0, "input": 0, "output": 0, "total": 0}
         groups = []
         for (d2, model, prov), v in day.items():
             if d2 != di:
@@ -1299,6 +1320,47 @@ def _report_stats(con, covers=frozenset()):
             except Exception:
                 pass
         days.append(row)
+    return days
+
+
+def _report_stats(con, covers=frozenset()):
+    """用量报表聚合（快照可选字段 stats，仅桌面链，v260）：近 30 天 completed 行
+    单次扫描分桶。范围桶 today/d7/d30 × (model_id, provider_id)：全部行累计
+    tokens/次数（与今日合计、models 报表同口径，含子代理），速度仅 main_turn 行按
+    _row_gen_ms 窗口（200ms–1h 有效段）累计——与状态条会话均同口径，辅助 query_source
+    与子代理行不进速度分母。日桶 × (model, provider) 供每日费用。范围/日均本地自然日
+    闭区间（today=今日，d7=今日+前 6 天，d30=今日+前 29 天，同 daily_usage 语义）。
+    出口按 model_id 合并、total 降序，provider 取请求数最多者展示；价表模块可用时带
+    cost_usd/rates（缺失省略费用字段，token 照常输出）。sessions 复用 recent_sessions
+    并过滤子会话。v262：出口追加 totals（范围汇总卡）——today/d7/d30 各一份跨模型
+    合计（requests/input/output/total/cache_read/cache_write/reasoning + 主链加权 tps
+    + started/last_at 极值），供 ⚙ 报表的今日/近7天/近30天汇总卡渲染。v265：days 行
+    附 `date`（ISO 本地日期），趋势柱可点击进入该单日。"""
+    bounds = [_epoch_ms(_day_start(datetime.now() - timedelta(days=i)))
+              for i in range(29, -1, -1)]
+    labels = _report_day_labels(bounds)
+    rng, day = {}, {}   # (范围桶, model, prov) / (日桶, model, prov) → 累计数组
+    for r in con.execute(
+            """select model_id, provider_id, input_tokens, output_tokens,
+                      cache_read_input_tokens, cache_creation_input_tokens,
+                      started_at, first_token_at, completed_at, reasoning_tokens, query_source
+               from model_usage
+               where status='completed' and completed_at >= ?""", (bounds[0],)):
+        di = _report_day_index(bounds, r["completed_at"] or 0)
+        if di < 0:
+            continue
+        model, prov = r["model_id"] or "", r["provider_id"] or ""
+        for b in ((0, 1, 2) if di == 29 else ((1, 2) if di >= 23 else (2,))):
+            # v262 桶 11 槽：a[8]=思考 tokens（与 tokens 同口径，含子代理）、
+            # a[9]/a[10]=范围内 started/completed 极值（范围汇总卡时间范围行）
+            _report_bucket_add(
+                rng.setdefault((b, model, prov), [0, 0, 0, 0, 0, 0, 0, 0, 0, None, None]),
+                r, covers)
+        _report_day_add(day.setdefault((di, model, prov), [0, 0, 0, 0, 0, 0]), r)
+
+    def _range_buckets(i):
+        return ((m, p, v) for (bk, m, p), v in rng.items() if bk == i)
+
     sess = []
     for r in recent_sessions(con, 20):
         sid = str(r[0] or "")
@@ -1309,37 +1371,68 @@ def _report_stats(con, covers=frozenset()):
                      "total": (r[4] or 0) + (r[5] or 0), "last_at": r[7] or 0})
         if len(sess) >= 10:
             break
-    def _range_totals(i):
-        """v262 范围汇总（跨模型合计）：今日/近7天/近30天汇总卡的字段——tokens/次数/
-        缓存/思考跨模型求和（含子代理），tps=主链 Σrated ÷ Σgen（同会话均口径），
-        时间范围取范围内 started/completed 极值。"""
-        req = inp = out = cr = cw = rated = unrated = gen = rea = 0
-        started = last_at = None
-        for (bk, _m, _p), v in rng.items():
-            if bk != i:
-                continue
-            req += v[0]
-            inp += v[1]
-            out += v[2]
-            cr += v[3]
-            cw += v[4]
-            rated += v[5]
-            unrated += v[6]
-            gen += v[7]
-            rea += v[8]
-            if v[9] is not None and (started is None or v[9] < started):
-                started = v[9]
-            if v[10] is not None and (last_at is None or v[10] > last_at):
-                last_at = v[10]
-        return {"requests": req, "input": inp, "output": out, "total": inp + out,
-                "cache_read": cr, "cache_write": cw, "reasoning": rea,
-                "rated_output": rated, "unrated_output": unrated, "gen_ms": gen,
-                "tps": _rated_tps(rated, gen),
-                "started": started or 0, "last_at": last_at or 0}
 
-    return {"models": {rid: _bucket_rows(i) for i, rid in enumerate(_REPORT_RANGES)},
-            "days": days, "sessions": sess,
-            "totals": {rid: _range_totals(i) for i, rid in enumerate(_REPORT_RANGES)}}
+    return {"models": {rid: _report_model_rows(_range_buckets(i))
+                       for i, rid in enumerate(_REPORT_RANGES)},
+            "days": _report_day_rows(day, labels), "sessions": sess,
+            "totals": {rid: _report_totals(_range_buckets(i))
+                       for i, rid in enumerate(_REPORT_RANGES)}}
+
+
+_REPORT_RANGE_MAX_DAYS = 366
+
+
+def _parse_range_dates(argv):
+    """report-range 的 FROM/TO 严格解析：YYYY-MM-DD 零填充、start<=end、
+    跨度 ≤366 天（含首尾）。非法输入抛 ValueError（CLI 转成单行 JSON error）。"""
+    if len(argv) < 2:
+        raise ValueError("report-range requires FROM and TO (YYYY-MM-DD)")
+    raw_from, raw_to = str(argv[0]), str(argv[1])
+    for raw in (raw_from, raw_to):
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            raise ValueError("invalid date format (YYYY-MM-DD)")
+    try:
+        start = datetime.strptime(raw_from, "%Y-%m-%d")
+        end = datetime.strptime(raw_to, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError("invalid date")
+    if start > end:
+        raise ValueError("start date is after end date")
+    if (end - start).days + 1 > _REPORT_RANGE_MAX_DAYS:
+        raise ValueError("range exceeds %d days" % _REPORT_RANGE_MAX_DAYS)
+    return start, end
+
+
+def _report_range_stats(con, start, end, covers=frozenset()):
+    """任意本地自然日范围报表（v265 自选范围/单日，桌面主进程按需一次性查询）：
+    [start 00:00, end+1 00:00) 单次扫描，返回 from/to/models/totals/days。口径同
+    _report_stats（tokens/次数含子代理，速度仅 main_turn 有效段，费用随价表可选）；
+    日行含 ISO date，多日范围可直接复用趋势柱。跨度由 _parse_range_dates 限制。"""
+    day_count = (end - start).days + 1
+    bounds = [_epoch_ms(_day_start(start + timedelta(days=i))) for i in range(day_count)]
+    labels = _report_day_labels(bounds)
+    end_ms = _epoch_ms(_day_start(end) + timedelta(days=1))
+    per, day = {}, {}
+    for r in con.execute(
+            """select model_id, provider_id, input_tokens, output_tokens,
+                      cache_read_input_tokens, cache_creation_input_tokens,
+                      started_at, first_token_at, completed_at, reasoning_tokens, query_source
+               from model_usage
+               where status='completed' and completed_at >= ? and completed_at < ?""",
+            (bounds[0], end_ms)):
+        di = _report_day_index(bounds, r["completed_at"] or 0)
+        if di < 0 or di >= day_count:
+            continue
+        model, prov = r["model_id"] or "", r["provider_id"] or ""
+        _report_bucket_add(
+            per.setdefault((model, prov), [0, 0, 0, 0, 0, 0, 0, 0, 0, None, None]),
+            r, covers)
+        _report_day_add(day.setdefault((di, model, prov), [0, 0, 0, 0, 0, 0]), r)
+    buckets = [(model, prov, v) for (model, prov), v in per.items()]
+    return {"from": start.strftime("%Y-%m-%d"), "to": end.strftime("%Y-%m-%d"),
+            "models": _report_model_rows(buckets),
+            "totals": _report_totals(buckets),
+            "days": _report_day_rows(day, labels)}
 
 
 def _speed_segments(con, sid, covers=frozenset()):
@@ -2601,6 +2694,50 @@ def snapshot(force_sid="", routes=None, serve_con=None):
 # ---------- CLI ----------
 
 _SERVE_IDLE_S = 60.0   # serve 复用连接的空闲重建阈值（测试把它调成负数即可覆盖回收分支）
+# v266：相关表没变时直接回放上一份快照。宿主请求完成才一次性 INSERT（运行中无行），
+# 生成期间每秒变化的只是 part，而泵 1.5s 触发一次 2.2s 全量快照——绝大多数计算结果相同。
+_SERVE_CACHE_MAX_AGE = 30.0
+_SERVE_SAME = '{"same":1}'
+
+
+def _serve_change_token(con):
+    """v266：常驻快照快路径判据——只取会改变快照的写入。
+
+    model_usage/turn_usage/tool_usage/session 的插入都发生在请求或工具完成时，
+    取 max(rowid) 均 O(1)（实测 <0.05ms）；不能取 count(*) 或 max(completed_at)
+    （52k 行全扫 ~50ms，探测成本会吃回收益）。config.json mtime 一并纳入，
+    改配置（lang/pricing 等）不必等缓存上限。任一查询失败（老库缺表/连接已坏）
+    返回 None，调用方退回全量路径。
+    """
+    vals = []
+    for sql in ("select max(rowid) from model_usage",
+                "select max(rowid) from turn_usage",
+                "select max(rowid) from tool_usage",
+                "select max(rowid) from session"):
+        try:
+            row = con.execute(sql).fetchone()
+        except sqlite3.Error:
+            return None
+        vals.append(row[0] if row else None)
+    try:
+        vals.append(os.stat(CONFIG_PATH).st_mtime_ns)
+    except OSError:
+        vals.append(0)
+    return tuple(vals)
+
+
+def _query_same_ok(line):
+    """v266：新泵在 JSON 请求里带 same_ok=1，缓存命中时回 {"same":1} 让泵跳过整包重推。
+
+    旧泵不带该键 → 仍回完整的缓存包；新旧版本任意组合都能工作（升级不要求同步重启）。
+    """
+    if not line.lstrip().startswith("{"):
+        return False
+    try:
+        data = json.loads(line)
+    except ValueError:
+        return False
+    return isinstance(data, dict) and data.get("same_ok") in (1, True)
 
 
 def serve():
@@ -2625,15 +2762,21 @@ def serve():
     con = None
     stamp = None
     last_used = 0.0
+    # v266 快照缓存：请求行 + 变更戳 + 序列化结果；连接重建/查询异常一律清空。
+    cache_req = None
+    cache_tok = None
+    cache_out = None
+    cache_at = 0.0
 
     def _drop():
-        nonlocal con
+        nonlocal con, cache_req, cache_tok, cache_out
         if con is not None:
             try:
                 con.close()
             except sqlite3.Error:
                 pass
             con = None
+        cache_req = cache_tok = cache_out = None
 
     while True:
         line = sys.stdin.readline()
@@ -2662,9 +2805,24 @@ def serve():
                     stamp = stamp_now
             except sqlite3.Error:
                 con = None
+        req = line.strip()
         try:
-            force_sid, routes = _parse_query(line.strip())
-            out = json.dumps(snapshot(force_sid, routes, serve_con=con))
+            force_sid, routes = _parse_query(req)
+            out = None
+            tok = None
+            if con is not None and not routes:
+                tok = _serve_change_token(con)
+                if (tok is not None and cache_out is not None and req == cache_req
+                        and tok == cache_tok and now - cache_at < _SERVE_CACHE_MAX_AGE):
+                    # 相关表没变：旧泵拿完整缓存包，新泵只拿 {"same":1} 跳过整包重推。
+                    out = _SERVE_SAME if _query_same_ok(req) else cache_out
+            if out is None:
+                payload = snapshot(force_sid, routes, serve_con=con)
+                out = json.dumps(payload)
+                # 远端 scopes 请求永不缓存（远端数据可独立变化）；失败载荷不缓存。
+                if (con is not None and not routes and tok is not None
+                        and not (isinstance(payload, dict) and payload.get("error"))):
+                    cache_req, cache_tok, cache_out, cache_at = req, tok, out, now
         except Exception as e:
             out = json.dumps({"error": str(e)[:200]})   # 单次查询失败不杀常驻进程
             _drop()   # 异常路径下连接状态未知：弃用，下轮重建
@@ -2704,6 +2862,22 @@ def main(argv):
             return 0
         if cmd == "serve":
             serve()
+            return 0
+        if cmd == "report-range":
+            # v265：自选范围报表（主进程 execFile 按需调用）。成功/失败都只打印一行
+            # JSON，不落入下方人类可读分支或外层 sqlite 文案，保证 stdout 可解析。
+            try:
+                start, end = _parse_range_dates(argv[1:])
+                con = connect()
+                try:
+                    data = _report_range_stats(
+                        con, start, end, _provider_first_token_covers(con))
+                finally:
+                    con.close()
+            except Exception as e:
+                print(json.dumps({"error": str(e)[:200]}))
+                return 1
+            print(json.dumps(data))
             return 0
         con = connect()
         if cmd == "now":

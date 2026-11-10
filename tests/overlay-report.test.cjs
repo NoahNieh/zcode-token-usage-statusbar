@@ -102,6 +102,9 @@ function harness({ prefs = {} } = {}) {
   function inject() { window.__zusageOverlay = false; vm.runInContext(executable, sandbox); }
   function tick() { for (const t of [...timers.values()]) if (t.interval && (t.ms === 600 || t.ms === 500)) t.fn(); }
   function boot() { for (const [n, t] of [...timers]) if (!t.interval && t.ms === 0) { timers.delete(n); t.fn(); } }
+  function flushTimeout(ms) {
+    for (const [n, t] of [...timers]) if (!t.interval && t.ms === ms) { timers.delete(n); t.fn(); }
+  }
   function buildComposer(pid, sid) {
     const card = body.appendChild(new Element());
     const row = card.appendChild(new Element());
@@ -132,7 +135,7 @@ function harness({ prefs = {} } = {}) {
     for (const fn of panel().listeners.get('click') || []) fn(evt);
     return tab;
   }
-  return { window, body, inject, boot, tick, buildComposer, payload, panel, repBody, clickTab, state: () => window.quotaTest.state() };
+  return { window, body, inject, boot, tick, flushTimeout, buildComposer, payload, panel, repBody, clickTab, state: () => window.quotaTest.state() };
 }
 
 const NOW = 1_799_000_000_000;
@@ -163,12 +166,12 @@ function sessRow() {
 }
 const setup = h => { h.buildComposer('workspace-main', 'sid_main'); h.inject(); h.boot(); h.tick(); };
 
-test('report section is registered in the nav with the five-view switcher and caliber details', () => {
+test('report section is registered in the nav with the six-view switcher and caliber details', () => {
   const h = harness(); setup(h);
   const panelHtml = h.panel().innerHTML;
   assert.ok(panelHtml.includes('data-sec="report"'), 'report section in panel');
   assert.ok(panelHtml.includes('用量报表'), 'zh label');
-  for (const v of ['session', 'project', 'today', 'd7', 'd30']) {
+  for (const v of ['session', 'project', 'today', 'd7', 'd30', 'custom']) {
     assert.ok(panelHtml.includes('data-rep-view="' + v + '"'), 'tab ' + v);
   }
   assert.ok(panelHtml.includes('zu-rep-cal'), 'caliber details block');
@@ -314,4 +317,118 @@ test('empty range: totals zeros render a zero card with the no-request note, no 
   assert.ok(html.includes('该范围暂无请求'), 'no-request note');
   assert.ok(!html.includes('zu-stat-table'), 'no model table');
   assert.ok(html.includes('今日合计'), 'card head still rendered');
+});
+
+/* ---------- v265 自选范围与点击选日 ---------- */
+
+const isoAdd = (iso, n) => new Date(Date.parse(iso + 'T00:00:00Z') + n * 86400000).toISOString().slice(0, 10);
+const localTodayIso = () => {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+};
+const rangeReq = h => h.window.__zusagePluginRequests.filter(r => r.action === 'report-range');
+const sendChange = (h, cls, value) => {
+  const el = new Element('input');
+  el.className = cls;
+  el.value = value;
+  for (const fn of h.panel().listeners.get('change') || []) fn({ target: el });
+};
+
+test('custom view: default range request, loading, then card + daily trend', () => {
+  const h = harness(); setup(h);
+  h.window.__zusageUpdate(h.payload(STATS()));
+  h.clickTab('custom');
+  const reqs = rangeReq(h);
+  assert.equal(reqs.length, 1, 'entering custom issues one report-range request');
+  const req = reqs[0];
+  assert.match(req.from, /^\d{4}-\d{2}-\d{2}$/);
+  assert.match(req.to, /^\d{4}-\d{2}-\d{2}$/);
+  assert.ok(req.from <= req.to, 'default range is ordered');
+  const loadingHtml = h.repBody().innerHTML;
+  assert.ok(loadingHtml.includes('正在查询'), 'loading state');
+  assert.ok(loadingHtml.includes('zu-rep-from'), 'start date input rendered');
+  assert.ok(loadingHtml.includes('zu-rep-to'), 'end date input rendered');
+
+  const days = [];
+  for (let i = 6; i >= 0; i--) days.push({ d: 'day' + i, date: isoAdd(req.to, -i), requests: 1, total: 100 });
+  h.window.__zusagePluginResult({ id: req.requestId, ok: true, from: req.from, to: req.to,
+    totals: TOTALS(), models: [ROW()], days });
+  const html = h.repBody().innerHTML;
+  assert.ok(html.includes('自选范围'), 'custom card head');
+  assert.ok(html.includes('50.5'), 'weighted tps from totals');
+  assert.ok(html.includes('<th>缓存命中</th>'), 'model cache-hit column');
+  assert.ok(html.includes('每日趋势'), 'multi-day trend rendered');
+  assert.ok(html.includes('data-rep-day="' + days[0].date + '"'), 'dated bars are clickable buttons');
+  assert.ok(html.includes('点击查看当天'), 'bar tooltip hint');
+  assert.ok(!html.includes('最近会话'), 'custom view omits the global recent-session list');
+});
+
+test('custom view: date change requests the picked range; inverted range shows a note without a request', () => {
+  const h = harness(); setup(h);
+  h.window.__zusageUpdate(h.payload(STATS()));
+  h.clickTab('custom');
+  const first = rangeReq(h)[0];
+  h.window.__zusagePluginResult({ id: first.requestId, ok: true, from: first.from, to: first.to,
+    totals: TOTALS(), models: [ROW()], days: [] });
+
+  const pickedTo = isoAdd(first.from, -10);   // 早于默认 from → 倒序
+  sendChange(h, 'zu-rep-to', pickedTo);
+  assert.equal(rangeReq(h).length, 1, 'no request for an inverted range');
+  assert.ok(h.repBody().innerHTML.includes('开始日期不能晚于结束日期'), 'order problem note');
+
+  const pickedFrom = isoAdd(pickedTo, -5);
+  sendChange(h, 'zu-rep-from', pickedFrom);
+  const reqs = rangeReq(h);
+  assert.equal(reqs.length, 2, 'valid range issues one request');
+  assert.equal(reqs[1].from, pickedFrom);
+  assert.equal(reqs[1].to, pickedTo);
+});
+
+test('custom view: >366 days is rejected locally without a request', () => {
+  const h = harness(); setup(h);
+  h.window.__zusageUpdate(h.payload(STATS()));
+  h.clickTab('custom');
+  const first = rangeReq(h)[0];
+  h.window.__zusagePluginResult({ id: first.requestId, ok: true, from: first.from, to: first.to,
+    totals: TOTALS(), models: [ROW()], days: [] });
+  sendChange(h, 'zu-rep-from', isoAdd(first.to, -400));
+  assert.equal(rangeReq(h).length, 1, 'no request for a >366-day range');
+  assert.ok(h.repBody().innerHTML.includes('单次最多查询 366 天'), 'range-too-long note');
+});
+
+test('clicking a dated daily bar switches to a single-day custom query', () => {
+  const h = harness(); setup(h);
+  const s = STATS();
+  const dayIso = isoAdd(localTodayIso(), -1);
+  s.days[29].date = dayIso;
+  s.days[29].requests = 10;
+  s.days[29].total = 300;
+  h.window.__zusageUpdate(h.payload(s));
+  h.clickTab('d7');
+  const bar = { getAttribute: k => (k === 'data-rep-day' ? dayIso : null) };
+  const evt = { target: { closest: sel => (sel === '.zu-rep-bar' ? bar : null) } };
+  for (const fn of h.panel().listeners.get('click') || []) fn(evt);
+  assert.equal(h.state().repView, 'custom', 'bar click switches view');
+  assert.equal(h.state().repFrom, dayIso);
+  assert.equal(h.state().repTo, dayIso);
+  const reqs = rangeReq(h);
+  assert.equal(reqs.length, 1);
+  assert.equal(reqs[0].from, dayIso);
+  assert.equal(reqs[0].to, dayIso);
+});
+
+test('old main process unknown action and query timeout render restart/retry guidance', () => {
+  const h1 = harness(); setup(h1);
+  h1.window.__zusageUpdate(h1.payload(STATS()));
+  h1.clickTab('custom');
+  const req = rangeReq(h1)[0];
+  h1.window.__zusagePluginResult({ id: req.requestId, ok: false, error: 'unknown action: report-range' });
+  assert.ok(h1.repBody().innerHTML.includes('完全退出并重开 ZCode'), 'unknown action guidance');
+
+  const h2 = harness(); setup(h2);
+  h2.window.__zusageUpdate(h2.payload(STATS()));
+  h2.clickTab('custom');
+  h2.flushTimeout(12000);
+  assert.ok(h2.repBody().innerHTML.includes('查询超时'), 'timeout guidance');
 });
