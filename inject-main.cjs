@@ -198,6 +198,9 @@ try {
     }
     scheduleRetry(300);
   });
+  /* 宿主 3.18.2 起删除 zcode:sync-web-remote-control-tasks 通道（渲染端不再发送）：
+   * 监听保留兼容旧宿主，3.18+ 上静默不触发——远端任务证据退化由 workspaces 通道
+   * 单独承担（remoteEvidence 兜底路径），fail-closed 语义不变。 */
   ipcMain.on("zcode:sync-web-remote-control-tasks", (e, rows) => {
     if (!trustedSender(e) || !Array.isArray(rows)) return;
     const tasks = new Map();

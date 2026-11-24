@@ -50,7 +50,7 @@
 | `install_monitor.py` | 重启提醒、加载诊断和 Windows 待替换收尾 |
 | `plugin-updater.cjs` / `plugin-release.cjs` | 宿主插件更新调度、正式 GitHub Release 与渠道校验、更新日志（Release 说明）拉取与缓存 |
 | `plugin-storage.cjs` | 按宿主存储解析用户级插件库存/缓存，不假设固定 HOME |
-| `quota-client.cjs` | 套餐额度客户端（主进程，热换）：解密宿主 OAuth 凭据（`enc:v1` AES-256-GCM 重写实现）直查 BigModel/Z.ai monitor 端点，归一化窗口/退避/冻结/epoch 竞态，凭据只在内存 |
+| `quota-client.cjs` | 套餐额度客户端（主进程，热换）：解密宿主 OAuth 凭据（`enc:v1`/`enc:v2` AES-256-GCM 重写实现，v2 主密钥按需读 OS 凭据库）直查 BigModel/Z.ai monitor 端点，归一化窗口/退避/冻结/epoch 竞态，凭据只在内存 |
 | `runtime_lock.py` / `release_unpack.py` | 跨进程锁、配置事务/可信同步、安全 ZIP 解包 |
 | `sync_plugin.py` / `release_tool.py` | 根源码副本同步；确定性发布包构建、校验、发布预演/发布 |
 | `plugins/zcode-token-usage-statusbar/` | 两份 manifest、`.mcp.json`、命令、技能、hooks、专有安装/更新/提醒入口与共享副本 |

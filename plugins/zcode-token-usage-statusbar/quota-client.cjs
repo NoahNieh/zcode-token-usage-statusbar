@@ -20,8 +20,12 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { execFile } = require("child_process");
 
 const ENC_PREFIX = "enc:v1:";
+const ENC2_PREFIX = "enc:v2:";             // 3.18.0+ 宿主凭据格式（读后自动迁移，v1 值会消失）
+const KEYRING_SERVICE = "ZCode Credential Encryption";   // 宿主主密钥所在 OS 凭据库条目 service 名
+const CIPHER_WARM_RETRY_MS = 60 * 1000;    // 密钥解析失败退避；成功后本进程内不再重读
 const QUOTA_PATH = "/api/monitor/usage/quota/limit";
 const TTL_MS = 10 * 60 * 1000;            // 套餐窗默认（对齐宿主 usageEntitlementCache）
 const TTL_BALANCE_MS = 15 * 60 * 1000;    // 余额默认（dsh 同款）
@@ -61,7 +65,7 @@ function jwtExpMs(token) {
   } catch (e) { return null; }
 }
 
-/* ---------- 宿主凭据解密（enc:v1 AES-256-GCM，按宿主语义重写） ---------- */
+/* ---------- 宿主凭据解密（enc:v1 / enc:v2 AES-256-GCM，按宿主语义重写） ---------- */
 function deriveSecret(env) {
   const conf = env.ZCODE_CREDENTIAL_SECRET;
   if (conf) return conf;
@@ -70,10 +74,15 @@ function deriveSecret(env) {
   return `zcode-credential-fallback:${os.platform()}:${os.homedir()}:${username}`;
 }
 function deriveCipherKey(env) { return crypto.createHash("sha256").update(deriveSecret(env)).digest(); }
-function decryptValue(value, key) {
-  if (typeof value !== "string" || !value.startsWith(ENC_PREFIX)) return value;
-  const parts = value.slice(ENC_PREFIX.length).split(".");
-  if (parts.length !== 3 || !parts[0] || !parts[1] || parts[2] === undefined) return null;
+/* v2（3.18.0+）：`enc:v2:<source>:<指纹>:<iv.tag.ct>`。source 仅 os|env；指纹=sha256(密钥)
+ * 的 hex 前 24 字符（12 字节），只做校验不携带密钥；密文段与 v1 同布局（各段 base64url，
+ * iv 12B / tag 16B，无 AAD、无 KDF——os 源密钥为原始 32B，env 源为 sha256(秘密串)）。
+ * 主密钥不在值里，在 OS 凭据库条目 `<sha256(credentials.json 绝对路径)>.<service>`（值=
+ * 43 字符 base64url）。解不出按 fail-closed，与宿主解密失败同向，绝不显示 0%。 */
+function cipherFp(key) { return crypto.createHash("sha256").update(key).digest("hex").slice(0, 24); }
+function openCipher(payload, key) {
+  const parts = payload.split(".");
+  if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2]) return null;
   let iv, tag, ct;
   try {
     iv = Buffer.from(parts[0], "base64url");
@@ -86,6 +95,117 @@ function decryptValue(value, key) {
     d.setAuthTag(tag);
     return Buffer.concat([d.update(ct), d.final()]).toString("utf8");
   } catch (e) { return null; }
+}
+function decryptValue(value, key, cipherKeys) {
+  if (typeof value !== "string") return value;
+  if (value.startsWith(ENC_PREFIX)) {
+    const parts = value.slice(ENC_PREFIX.length).split(".");
+    if (parts.length !== 3 || !parts[0] || !parts[1] || parts[2] === undefined) return null;
+    let iv, tag, ct;
+    try {
+      iv = Buffer.from(parts[0], "base64url");
+      tag = Buffer.from(parts[1], "base64url");
+      ct = Buffer.from(parts[2], "base64url");
+    } catch (e) { return null; }
+    if (iv.length !== 12 || tag.length !== 16) return null;
+    try {
+      const d = crypto.createDecipheriv("aes-256-gcm", key, iv);
+      d.setAuthTag(tag);
+      return Buffer.concat([d.update(ct), d.final()]).toString("utf8");
+    } catch (e) { return null; }
+  }
+  if (value.startsWith(ENC2_PREFIX)) {
+    const segs = value.slice(ENC2_PREFIX.length).split(":");
+    if (segs.length !== 3 || !segs[0] || !segs[1] || !segs[2]) return null;
+    if (!/^(os|env)$/.test(segs[0]) || !/^[0-9a-f]{24}$/.test(segs[1])) return null;
+    for (const row of cipherKeys || []) {
+      if (!row || row.source !== segs[0] || !row.key || cipherFp(row.key) !== segs[1]) continue;
+      const out = openCipher(segs[2], row.key);
+      if (out !== null) return out;
+    }
+    return null;
+  }
+  return value;
+}
+
+/* ---------- v2 主密钥读取（OS 凭据库；凭据只进内存，不落日志/诊断） ---------- */
+/* Windows Credential Manager：LegacyGeneric 条目 blob 为 napi-rs keyring 写入的 UTF-16LE。
+ * 脚本是静态文本，目标名（仅 [0-9a-f.] 与 service 名）拼进脚本后整体走 -EncodedCommand，
+ * 不经 shell、无引号歧义、命令行不携带任何秘密；拒绝/缺失按 null（fail-closed）。 */
+const PS_CREDREAD =
+  "$ErrorActionPreference='Stop'\n" +
+  "$t='<TARGET>'\n" +
+  "$sig='using System;using System.Runtime.InteropServices;public static class ZCred{" +
+  "[StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)]public struct CREDENTIAL{" +
+  "public int Flags;public int Type;public string TargetName;public string Comment;" +
+  "public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;" +
+  "public int CredentialBlobSize;public IntPtr CredentialBlob;public int Persist;" +
+  "public int AttributeCount;public IntPtr Attributes;public string TargetAlias;public string UserName;}" +
+  "[DllImport(\"advapi32.dll\",CharSet=CharSet.Unicode,SetLastError=true)]" +
+  "public static extern bool CredRead(string target,int type,int flags,out IntPtr credPtr);" +
+  "[DllImport(\"advapi32.dll\")]public static extern void CredFree(IntPtr cred);}'\n" +
+  "Add-Type -TypeDefinition $sig\n" +
+  "$p=[IntPtr]::Zero\n" +
+  "if(-not [ZCred]::CredRead($t,1,0,[ref]$p)){exit 3}\n" +
+  "$c=[Runtime.InteropServices.Marshal]::PtrToStructure($p,[type][ZCred+CREDENTIAL])\n" +
+  "try{\n" +
+  "if($c.CredentialBlobSize -le 0){exit 4}\n" +
+  "$b=New-Object byte[] $c.CredentialBlobSize\n" +
+  "[Runtime.InteropServices.Marshal]::Copy($c.CredentialBlob,$b,0,$c.CredentialBlobSize)\n" +
+  "[Console]::Out.Write([Text.Encoding]::Unicode.GetString($b))\n" +
+  "}finally{[ZCred]::CredFree($p)}\n";
+function keyringReadDefault(account) {
+  return new Promise((resolve) => {
+    try {
+      if (process.platform === "win32") {
+        const script = PS_CREDREAD.replace("<TARGET>", account + "." + KEYRING_SERVICE);
+        execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+          "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")],
+          { timeout: 8000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
+          (err, stdout) => { resolve(err ? null : String(stdout).trim()); });
+        return;
+      }
+      if (process.platform === "darwin") {
+        /* Keychain ACL 只授信宿主进程：security CLI 可能被拒甚至弹授权框，失败不重试（见 warmCipher） */
+        execFile("security", ["find-generic-password", "-s", KEYRING_SERVICE, "-a", account, "-w"],
+          { timeout: 8000, stdio: ["ignore", "pipe", "ignore"] },
+          (err, stdout) => { resolve(err ? null : String(stdout).trim()); });
+        return;
+      }
+      /* Linux secret-service（keyring-rs 属性 service/username）；secret-tool 缺失同 fail-closed */
+      execFile("secret-tool", ["lookup", "service", KEYRING_SERVICE, "username", account],
+        { timeout: 8000, stdio: ["ignore", "pipe", "ignore"] },
+        (err, stdout) => { resolve(err ? null : String(stdout).trim()); });
+    } catch (e) { resolve(null); }
+  });
+}
+/* 宿主 getKey 同序：ZCODE_CREDENTIAL_SECRET(_FILE) 在场时宿主不会用 OS 库加密，
+ * 只认 env 源（同步解析即热，零 OS 读取）；否则读 OS 库拿 os 源原始 32B（值=43 字符 base64url）。 */
+function resolveEnvCipherRows(env) {
+  let envSecret = typeof env.ZCODE_CREDENTIAL_SECRET === "string" ? env.ZCODE_CREDENTIAL_SECRET : "";
+  if (!envSecret) {
+    const sf = env.ZCODE_CREDENTIAL_SECRET_FILE;
+    if (typeof sf === "string" && sf) {
+      try {
+        const s = fs.readFileSync(sf, "utf8");
+        if (s.length >= 32 && s.length <= 4096) envSecret = s;
+      } catch (e) { /* 读不到按无 env 秘密 */ }
+    }
+  }
+  return envSecret ? [{ key: crypto.createHash("sha256").update(envSecret).digest(), source: "env" }] : [];
+}
+function resolveOsCipherRows(keyringRead, credsPath) {
+  const account = crypto.createHash("sha256").update(path.resolve(credsPath)).digest("hex");
+  return Promise.resolve().then(() => keyringRead(account)).then((raw) => {
+    const rows = [];
+    if (typeof raw === "string" && /^[A-Za-z0-9_-]{43}$/.test(raw)) {
+      try {
+        const key = Buffer.from(raw, "base64url");
+        if (key.length === 32) rows.push({ key, source: "os" });
+      } catch (e) { /* base64url 解不出按无 os 源 */ }
+    }
+    return rows;
+  });
 }
 
 /* ---------- BigModel/Z.ai monitor 归一化（v96 口径不变） ---------- */
@@ -613,7 +733,8 @@ for (const fam of ["bigmodel", "zai"]) {
       try { raw = j.readFile(j.credsPath); } catch (e) { return null; }
       const enc = raw && typeof raw === "object" ? raw[conf.credKey] : null;
       if (typeof enc !== "string" || !enc) return null;
-      const token = decryptValue(enc, deriveCipherKey(j.env));
+      if (enc.startsWith(ENC2_PREFIX)) { j.markCipherDemand(); j.warmCipher(); }   // v2 需要主密钥：按需预热
+      const token = decryptValue(enc, deriveCipherKey(j.env), j.cipherKeys);
       if (!token) return { decryptFailed: true, fingerprint: "host:" + sha16(enc) };
       return { token, fingerprint: "host:" + sha16(enc), source: "host" };
     },
@@ -667,7 +788,8 @@ ADAPTERS.push({
       try { raw = j.readFile(j.credsPath); } catch (e) { return null; }
       const enc = raw && typeof raw === "object" ? raw["zcodejwttoken"] : null;
       if (typeof enc !== "string" || !enc) return null;
-      token = decryptValue(enc, deriveCipherKey(j.env));
+      if (enc.startsWith(ENC2_PREFIX)) { j.markCipherDemand(); j.warmCipher(); }   // v2 需要主密钥：按需预热
+      token = decryptValue(enc, deriveCipherKey(j.env), j.cipherKeys);
       if (!token) return { decryptFailed: true, fingerprint: "host:" + sha16(enc) };
       source = "host";
     }
@@ -1561,6 +1683,33 @@ function createQuotaClient(opts) {
     familyApiKeyOf: (family, pid) => resolveFamilyApiKey(family, pid, readFile, customCfgPath, builtinCfgPath),
   };
 
+  /* v2 凭据主密钥解析（enc:v2 适配，o.keyringRead(accountHex) 可注入）：适配器见到 v2 值
+   * 才置需求并预热（v1/env-v1 用户零 OS 读取，测试不碰真实凭据库）；异步不阻塞，
+   * 冷缓存首个周期对 v2 值 fail-closed（decryptFailed→not_configured），热身完成后
+   * 下个 tick（2s 短档）自然收敛。OS 库不可用按 60s 退避；macOS 首次被 Keychain 拒后
+   * 不再重试（避免反复弹授权框）。密钥成功解析后本进程内不重读（轮换下次会话生效）。 */
+  j.cipherKeys = [];
+  let cipherWarm = null, cipherDemand = false, cipherFailedAt = -CIPHER_WARM_RETRY_MS;
+  function warmCipher() {
+    if (!cipherDemand || cipherWarm || j.cipherKeys.length) return;
+    const envRows = resolveEnvCipherRows(env);   // env 秘密在场：同步即热，首个周期即可解密
+    if (envRows.length) { j.cipherKeys = envRows; return; }
+    if (now() - cipherFailedAt < CIPHER_WARM_RETRY_MS) return;
+    cipherFailedAt = now();
+    const read = typeof o.keyringRead === "function" ? o.keyringRead : keyringReadDefault;
+    cipherWarm = resolveOsCipherRows(read, credsPath)
+      .then((rows) => {
+        j.cipherKeys = rows;
+        if (!rows.length && process.platform === "darwin") cipherFailedAt = Infinity;
+        log("quota cipher: " + (rows.length ? "v2 key resolved" : "v2 key unavailable"));
+      })
+      .catch((e) => { log("quota cipher: resolve failed " + String((e && e.message) || e).slice(0, 80)); })
+      .finally(() => { cipherWarm = null; });
+  }
+  /* 适配器 resolveCred 是模块级函数，只能经 j 触达闭包状态 */
+  j.markCipherDemand = () => { cipherDemand = true; };
+  j.warmCipher = warmCipher;
+
   /* 源状态：id → st（v96 单源状态机的每源实例） */
   const states = new Map();
   const byProvider = {};   // providerId → 源 id（同厂商不同 provider 也隔离）
@@ -1686,8 +1835,9 @@ function createQuotaClient(opts) {
       return false;
     }
     if (cred.decryptFailed) {
+      warmCipher();   // v2 主密钥热身中短重试；未置需求（v1 解密失败）回到常规退避
       if (st.status !== "not_configured") setState(st, { status: "not_configured", reason: "decrypt", lastError: "credential decrypt failed" });
-      st.nextAt = t + NOT_CONFIGURED_RETRY_MS;
+      st.nextAt = t + (cipherWarm ? 2 * 1000 : NOT_CONFIGURED_RETRY_MS);
       return false;
     }
     if (cred.fingerprint !== st.fingerprint) {
@@ -1874,8 +2024,9 @@ function createQuotaClient(opts) {
     if (!raw || typeof raw !== "object") return null;
     const oauthEnc = raw[famConf.credKey], jwtEnc = raw["zcodejwttoken"];
     if (typeof oauthEnc !== "string" || !oauthEnc || typeof jwtEnc !== "string" || !jwtEnc) return null;
-    const oauth = decryptValue(oauthEnc, deriveCipherKey(j.env));
-    const jwt = decryptValue(jwtEnc, deriveCipherKey(j.env));
+    if (oauthEnc.startsWith(ENC2_PREFIX) || jwtEnc.startsWith(ENC2_PREFIX)) { cipherDemand = true; warmCipher(); }
+    const oauth = decryptValue(oauthEnc, deriveCipherKey(j.env), j.cipherKeys);
+    const jwt = decryptValue(jwtEnc, deriveCipherKey(j.env), j.cipherKeys);
     if (!oauth || !jwt) return { decryptFailed: true, fingerprint: "host:" + sha16(oauthEnc + "\n" + jwtEnc) };
     if (!oauth.trim() || !jwt.trim()) return null;
     return { oauth: oauth.trim(), jwt: jwt.trim(), fingerprint: sha16(JSON.stringify([oauthEnc, jwtEnc])) };

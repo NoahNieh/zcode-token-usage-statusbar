@@ -25,6 +25,94 @@ test("decryptValue roundtrip, wrong key, bad format, plaintext passthrough", () 
   assert.equal(Q.decryptValue(42, KEY), 42);
 });
 
+/* ---------- enc:v2（3.18+ 宿主凭据格式：三段冒号，指纹+OS 库主密钥） ---------- */
+function encryptV2(plain, key, source) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const ct = Buffer.concat([c.update(plain, "utf8"), c.final()]);
+  const fp = crypto.createHash("sha256").update(key).digest("hex").slice(0, 24);
+  return "enc:v2:" + source + ":" + fp + ":" +
+    iv.toString("base64url") + "." + c.getAuthTag().toString("base64url") + "." + ct.toString("base64url");
+}
+const OSKEY = crypto.randomBytes(32);
+const OSKEY_B64 = OSKEY.toString("base64url");
+
+test("decryptValue v2 roundtrip, fp/source mismatch, bad format, passthrough", () => {
+  const rows = [{ key: OSKEY, source: "os" }];
+  const enc = encryptV2("tok.v2", OSKEY, "os");
+  assert.equal(Q.decryptValue(enc, KEY, rows), "tok.v2");
+  assert.equal(Q.decryptValue(enc, KEY, [{ key: crypto.randomBytes(32), source: "os" }]), null);   // 指纹不匹配
+  assert.equal(Q.decryptValue(enc, KEY, [{ key: OSKEY, source: "env" }]), null);   // source 不匹配
+  assert.equal(Q.decryptValue(enc, KEY, []), null);                                // 冷缓存 fail-closed
+  assert.equal(Q.decryptValue(enc, KEY), null);                                    // 未传 cipherKeys 同样 fail-closed
+  assert.equal(Q.decryptValue("enc:v2:os:zz:aa.bb.cc", KEY, rows), null);          // 指纹形状非法
+  assert.equal(Q.decryptValue("enc:v2:web:" + "a".repeat(24) + ":aa.bb.cc", KEY, rows), null);   // source 枚举外
+  assert.equal(Q.decryptValue("enc:v2:os", KEY, rows), null);                      // 段数不足
+  assert.equal(Q.decryptValue("enc:v2:os:" + "a".repeat(24) + ":only.two", KEY, rows), null);    // 密文段形状非法
+  assert.equal(Q.decryptValue("plain", KEY, rows), "plain");                       // 明文直通
+  const envKey = Q.deriveCipherKey({ ZCODE_CREDENTIAL_SECRET: "test-secret" });
+  assert.equal(Q.decryptValue(encryptV2("tok.env", envKey, "env"), KEY, [{ key: envKey, source: "env" }]), "tok.env");
+});
+
+test("client: v2-env creds decrypt on first tick via ZCODE_CREDENTIAL_SECRET, no OS keyring", () => {
+  const { client, calls } = makeClient({
+    creds: { "oauth:bigmodel:access_token": encryptV2("jwt.env.v2", KEY, "env") },
+  });
+  client.noteProvider("account:bigmodel-individual-coding-plan");
+  client.tick();
+  assert.equal(calls.length, 1);                       // env 秘密同步即热，首个周期即可解密
+  assert.equal(calls[0].auth, "jwt.env.v2");
+  calls[0].d.resolve(fakeRes(200, OK_BODY));
+  return flush().then(() => assert.equal(client.view().status, "ok"));
+});
+
+test("client: v2-os creds fail closed cold, converge after keyring warm", async () => {
+  const warmGate = deferred();
+  let warmCalls = 0;
+  const { client, clock, calls } = makeClient({
+    creds: { "oauth:bigmodel:access_token": encryptV2("jwt.os.v2", OSKEY, "os") },
+    env: { ZCODE_CREDENTIAL_SECRET: "" },   // 覆盖为空：走 OS 库路径
+    keyringRead: () => { warmCalls += 1; return warmGate.promise.then(() => OSKEY_B64); },
+  });
+  client.noteProvider("account:bigmodel-individual-coding-plan");
+  client.tick();
+  assert.equal(calls.length, 0);                       // 冷缓存首周期 fail-closed，不发请求
+  assert.equal(client.view().status, "not_configured");
+  warmGate.resolve();
+  await flush();
+  clock.t += 2000;                                     // 热身中 decryptFailed 的 2s 短档
+  client.tick();
+  assert.equal(calls.length, 1);                       // 热身后收敛
+  assert.equal(calls[0].auth, "jwt.os.v2");
+  calls[0].d.resolve(fakeRes(200, OK_BODY));
+  await flush();
+  assert.equal(client.view().status, "ok");
+  assert.equal(warmCalls, 1);                          // 密钥解析成功后本进程内不再重读
+  clock.t += Q.TTL_MS + 1;
+  client.tick();
+  assert.equal(calls.length, 2);                       // TTL 过期重查仍用同一密钥
+  calls[1].d.resolve(fakeRes(200, OK_BODY));
+  await flush();
+  assert.equal(client.view().status, "ok");
+});
+
+test("client: v2-os key unavailable backs off 60s without repeated keyring reads", async () => {
+  let warmCalls = 0;
+  const { client, clock, calls } = makeClient({
+    creds: { "oauth:bigmodel:access_token": encryptV2("jwt.x", OSKEY, "os") },
+    env: { ZCODE_CREDENTIAL_SECRET: "" },
+    keyringRead: () => { warmCalls += 1; return Promise.resolve(null); },
+  });
+  client.noteProvider("account:bigmodel-individual-coding-plan");
+  client.tick();
+  await flush();
+  clock.t += 2000; client.tick(); await flush();
+  clock.t += 2000; client.tick(); await flush();
+  assert.equal(warmCalls, 1);                          // 失败退避 60s，不反复读 OS 库
+  assert.equal(calls.length, 0);
+  assert.equal(client.view().status, "not_configured");
+});
+
 test("jwtExpMs reads exp; non-JWT yields null", () => {
   const payload = Buffer.from(JSON.stringify({ exp: 1793176110 })).toString("base64url");
   assert.equal(Q.jwtExpMs("h." + payload + ".s"), 1793176110 * 1000);
@@ -139,7 +227,7 @@ const T0 = 1700000000000;
 const BIGMODEL_URL = "https://bigmodel.cn/api/monitor/usage/quota/limit";
 
 /* credsRef.value 可变：模拟 credentials.json 刷新（密文变化） */
-function makeClient({ creds, env } = {}) {
+function makeClient({ creds, env, keyringRead } = {}) {
   const credsRef = { value: creds };
   const clock = { t: T0 };
   const calls = [];
@@ -147,6 +235,7 @@ function makeClient({ creds, env } = {}) {
     env: Object.assign({}, ENV, env || {}),   // 解密密钥与夹具加密同源
     now: () => clock.t,
     credsPath: "/virtual/credentials.json",
+    ...(keyringRead ? { keyringRead } : {}),
     readFile: () => {
       if (credsRef.value === undefined || credsRef.value === null) throw new Error("ENOENT");
       return credsRef.value;
