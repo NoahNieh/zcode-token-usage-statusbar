@@ -30,6 +30,21 @@ _BRIDGE_END_RE = re.compile(re.escape(BRIDGE_ID) + rb":v\d+ end \*/")
 # 表内版本的资产哈希漂移仍拒绝（fail-closed）；表外版本走 derive_target 的
 # 严格结构推导——任何一项不唯一/不符即拒绝，绝不对没验证过的 bundle 做字节手术。
 HOST_TARGETS = [
+    {"version": "4.0.0", "asset": "/out/renderer/assets/styles-D2WmIVpU.js",
+     "sha256": "c90eac8bff509bdc87e4b5dcd517df49e624da02efe592e9b2c92a2505eb3343",
+     "names": {"key": "hDe", "topic": "Ite", "registry": "_y"},
+     "pane": {"anchor": b'"data-testid":gC(pGe,e),"data-session-id":t??`draft`,',
+              "workspacePath": "l", "workspaceIdentity": "u", "remoteSessionId": "d", "paneId": "e"}},
+    {"version": "3.19.1", "asset": "/out/renderer/assets/styles-BKbqL3QI.js",
+     "sha256": "4b9ec63504f85b34016c678e46a56c5b812afeb61ded250a26a5acec6ff1185c",
+     "names": {"key": "JEe", "topic": "kte", "registry": "Ly"},
+     "pane": {"anchor": b'"data-testid":FC(qWe,e),"data-session-id":t??`draft`,',
+              "workspacePath": "l", "workspaceIdentity": "u", "remoteSessionId": "d", "paneId": "e"}},
+    {"version": "3.18.2", "asset": "/out/renderer/assets/styles-a4AckxCl.js",
+     "sha256": "80fd7ea8d093c2e8f7da002f0eca05545ed9e302673e3fc47cd1e3465299f9cd",
+     "names": {"key": "_me", "topic": "rte", "registry": "sh"},
+     "pane": {"anchor": b'"data-testid":aC(YVe,e),"data-session-id":t??`draft`,',
+              "workspacePath": "l", "workspaceIdentity": "u", "remoteSessionId": "d", "paneId": "e"}},
     {"version": "3.17.2", "asset": "/out/renderer/assets/styles-Dv5E6Odo.js",
      "sha256": "a0fa280cfbc3e132336c1b1fc9fc98caf4b73b57d588804cb661e3286645b625",
      "names": {"key": "eme", "topic": "kee", "registry": "Jp"},

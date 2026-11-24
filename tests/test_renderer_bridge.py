@@ -17,6 +17,9 @@ import patch_install as asar
 
 HOST = Path('/Applications/ZCode.app/Contents/Resources/app.asar')
 PANE_ANCHORS = {
+    '4.0.0': b'"data-testid":gC(pGe,e),"data-session-id":t??`draft`,',
+    '3.19.1': b'"data-testid":FC(qWe,e),"data-session-id":t??`draft`,',
+    '3.18.2': b'"data-testid":aC(YVe,e),"data-session-id":t??`draft`,',
     '3.17.2': b'"data-testid":Fx(hVe,e),"data-session-id":t??`draft`,',
     '3.17.1': b'"data-testid":Gb(aBe,e),"data-session-id":t??`draft`,',
     '3.16.3': b'"data-testid":Sb(WRe,e),"data-session-id":t??`draft`,',
