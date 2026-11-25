@@ -23,13 +23,12 @@ function runUpdateLive({ lastAvg, payloadAvg, noLastView }) {
     state: { rateLine: true, theme: 'compact', data: { session: { avg_tps: payloadAvg } } },
     lastView: noLastView ? undefined : { session: { avg_tps: lastAvg } },
     bridge: { turnId: 'turn_x', timer: null,
-      handle: { dead: false, charsPerToken: 2, tracker: { get: () => ({ complete: true }) } } },
+      handle: { dead: false, tracker: { get: () => ({ complete: true }) } } },
     sideHandleValid: () => true,
     bridgeDetach: () => {},
-    subRateTick: () => {},
+    subLiveTick: () => {},
     renderSubAgentRows: () => {},   // v185 并行线：Agent 行内速率 chip 渲染通道
-    subRate: { sum: null },
-    zuBarSpeedView: (...args) => { seen.args = args; return null; },
+        zuBarSpeedView: (...args) => { seen.args = args; return null; },
     syncTpsChip: () => {},
     liveKindCur: '', liveStatsCur: null,
     render: () => {},
@@ -39,14 +38,14 @@ function runUpdateLive({ lastAvg, payloadAvg, noLastView }) {
 }
 
 test('updateLive 取 lastView.session.avg_tps（本 pane），不取 payload 顶层 session', () => {
-  assert.equal(runUpdateLive({ lastAvg: 85.5, payloadAvg: 999 })[3], 85.5);
+  assert.equal(runUpdateLive({ lastAvg: 85.5, payloadAvg: 999 })[1], 85.5);   // v268：zuBarSpeedView(stats, sessAvg)，会话均是第 2 参
 });
 
 test('updateLive 对缺席/非正数/非有限会话均回退 0', () => {
   for (const v of [undefined, null, 0, -5, NaN, Infinity]) {
-    assert.equal(runUpdateLive({ lastAvg: v, payloadAvg: 999 })[3], 0, String(v));
+    assert.equal(runUpdateLive({ lastAvg: v, payloadAvg: 999 })[1], 0, String(v));
   }
-  assert.equal(runUpdateLive({ noLastView: true, payloadAvg: 999 })[3], 0, 'lastView null 时不抛错并回退 0');
+  assert.equal(runUpdateLive({ noLastView: true, payloadAvg: 999 })[1], 0, 'lastView null 时不抛错并回退 0');
 });
 
 /* v224 锁定：快速路径的新 tip 串必须写回 .it 格元素（__tip 宿主与 drawTip 读取都在格上）。
@@ -65,13 +64,12 @@ function runFastPath({ tipForOnCell = true, sameTip = false } = {}) {
     state: { rateLine: true, theme: 'default', data: {} },
     lastView: null,
     bridge: { turnId: 'turn_x', timer: null,
-      handle: { dead: false, charsPerToken: 2, tracker: { get: () => ({ complete: false }) } } },
+      handle: { dead: false, tracker: { get: () => ({ complete: false }) } } },
     sideHandleValid: () => true,
     bridgeDetach: () => {},
-    subRateTick: () => {},
+    subLiveTick: () => {},
     renderSubAgentRows: () => {},
-    subRate: { sum: null },
-    zuBarSpeedView: () => view,
+        zuBarSpeedView: () => view,
     buildLiveTip: v => (sameTip ? 'TIP:233.6 t/s' : 'TIP:' + v.text),
     syncTpsChip: () => {},
     liveKindCur: 'live', livePhaseCur: 'generate', liveStatsCur: null,

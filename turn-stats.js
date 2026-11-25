@@ -7,6 +7,8 @@
 
   function createTracker(options = {}) {
     const now = options.now || (() => performance.now());
+    // v268：不再统计字符增量。宿主流式输出期间 store 推送很密，逐行重数字符是 renderer 侧
+    // 的主要开销；运行中速率估算（主会话与子代理）已整体移除，这里只剩轮/行结构与阶段判定。
     const turns = new Map();
     let epoch = null;
     let session = null;
@@ -32,19 +34,15 @@
         const key = row.productTurnId || row.turnId;
         let turn = turns.get(key);
         if (!turn) {
-          turn = { sessionId: snapshot.sessionId, turnId: key, rows: new Map(), samples: [], observedAt: at };
+          turn = { sessionId: snapshot.sessionId, turnId: key, rows: new Map(), observedAt: at };
           turns.set(key, turn);
         }
         turn.rows.set(row.rowId, row);
       }
       for (const turn of turns.values()) {
-        let characters = 0;
         for (const id of turn.rows.keys()) if (!currentIds.has(id)) turn.rows.delete(id);
         if (turn.rows.size === 0) { turns.delete(turn.turnId); continue; }
         for (const row of turn.rows.values()) {
-          const text = row.kind === 'assistantText' || row.kind === 'reasoning' ? row.text :
-            row.kind === 'toolCall' ? row.inputText : '';
-          if (typeof text === 'string') characters += Array.from(text).length;
           // 只要曾经见过这一轮处于未完成状态，就记作"亲历过"：区分"实时追踪到的完成"
           // 与"刚绑定/重绑时一步到位捞到的历史存量已完成轮次"（后者可能缺详细字段，
           // 调用方据此决定是否展示"完成态"结论，而不是把陈年旧轮误判成刚发生的异常）。
@@ -53,10 +51,6 @@
             turn.seenIncomplete = true;
           }
         }
-        const last = turn.samples[turn.samples.length - 1];
-        if (last && last.characters > characters) turn.samples.length = 0;
-        if (!last || last.characters !== characters) turn.samples.push({ at, characters });
-        while (turn.samples.length > 2 && turn.samples[1].at < at - 2000) turn.samples.shift();
       }
       return true;
     }
@@ -67,13 +61,7 @@
       const header = Array.from(turn.rows.values()).find(row => row.kind === 'turnHeader');
       if (!header) return null;
       const complete = ['completedSuccess', 'completedInterrupted', 'failed'].includes(header.state);
-      const samples = turn.samples;
-      const first = samples[0];
-      const last = samples[samples.length - 1];
       const sampledAt = now();
-      const elapsed = first ? sampledAt - first.at : 0;
-      const characterRate = !complete && elapsed >= 200 && last && sampledAt - last.at <= 2000 ?
-        Math.max(0, last.characters - first.characters) * 1000 / elapsed : null;
       const outputTokens = Number.isFinite(header.outputTokens) && header.outputTokens >= 0 ? header.outputTokens : null;
       const modelMs = Number.isFinite(header.modelDurationMs) && header.modelDurationMs >= 0 ? header.modelDurationMs : null;
       const durationMs = Number.isFinite(header.activeMs) && header.activeMs >= 0 ? header.activeMs :
@@ -98,11 +86,11 @@
         : act && act.kind === 'subagent' && act.status === 'running'
         ? { name: 'Agent', startedAt: null,   // 子智能体行无 startedAt：只给动词，不给秒数
             // 行投影自带 childSessionId（宿主 subagent 行 schema）：调用方据此绑定子代理
-            // 会话 store 估算其运行期输出速率；无该字段时为 null，调用方按无数据降级。
+            // 会话（仅作运行登记；v268 起不再订阅估算速率）。无该字段时为 null。
             childSessionId: typeof act.childSessionId === 'string' && act.childSessionId ? act.childSessionId : null }
         : null;
       // 本轮全部运行中的子智能体行（并行派发时有多行）：runningTool 只反映最后一个
-      // 活动行，多槽位速率估算需要完整集合——按 rowId 升序稳定输出，无 childSessionId
+      // 活动行，运行中子代理登记需要完整集合——按 rowId 升序稳定输出，无 childSessionId
       // 的行无法绑定子会话 store，跳过。
       const runningSubagents = [];
       if (!complete) {
@@ -137,12 +125,11 @@
         startedAt: Number.isFinite(header.startedAt) ? header.startedAt : null,
         endedAt: Number.isFinite(header.endedAt) ? header.endedAt : null,
         toolMs: Number.isFinite(header.toolDurationMs) && header.toolDurationMs >= 0 ? header.toolDurationMs : null,
-        characterRate, observedMs: Math.max(0, sampledAt - turn.observedAt),
+        observedMs: Math.max(0, sampledAt - turn.observedAt),
         runningTool,   // null=没有进行中的工具（流式正文阶段/全部完成）；name 可能为空串（fallback 显示"执行中"）
         runningGroup,   // v187 补回 v181：null=运行行不在 ≥2 连续同类组尾（含子代理/完成态）；{kind:'explore'|'terminal', startedAt}
         runningSubagents,   // 全部 running subagent 行的 childSessionId（v97 多槽位）；完成态恒 []
         phase,   // 'thinking' | 'tool' | 'writing' | null（完成态恒 null）
-        totalCharacters: last ? last.characters : 0,   // 当前累计字符数：供调用方做 c2t（字符→token）自校准
         observedLive: !!turn.seenIncomplete,   // 是否亲历过"未完成→完成"：false=刚绑定/重绑时
           // 一步到位捞到的历史存量已完成轮次，而非这次订阅期间实时追踪到的完成
         tokenRate: complete && outputTokens !== null && modelMs >= 200 && modelMs < 3600000 ? outputTokens * 1000 / modelMs : null,
@@ -253,10 +240,7 @@
 
   function format(stats, cn, forceKmb) {
     if (!stats) return '';
-    if (!stats.complete) {
-      const speed = stats.characterRate === null ? '' : ` · ${stats.characterRate.toFixed(1)} 字符/s`;
-      return `⚡ 生成中 · 已观察 ${(stats.observedMs / 1000).toFixed(1)}s${speed}`;
-    }
+    if (!stats.complete) return `⚡ 生成中 · 已观察 ${(stats.observedMs / 1000).toFixed(1)}s`;
     const speed = stats.tokenRate == null || !Number.isFinite(stats.tokenRate) ? '生成时长缺失，暂不显示速率' : `${stats.tokenRate.toFixed(1)} token/s`;
     const output = stats.outputTokens === null ? '输出未知' : `输出 ${formatTokens(stats.outputTokens, cn, forceKmb)} token`;
     const duration = stats.durationMs === null ? '' : ` · 耗时 ${(stats.durationMs / 1000).toFixed(1)}s`;

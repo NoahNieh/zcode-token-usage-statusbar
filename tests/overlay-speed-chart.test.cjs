@@ -268,16 +268,17 @@ test('left card renders the eight states per the design (titles, prefixes, pills
   assert.match(sk, /title="zcode-github-release·执行中"/);
   // 思考：标题=statusText+...；计时
   assert.match(card({ kind: 'thinking', statusText: '思考中', elapsedText: '47秒', noteText: '生成尚未开始' }), /<span class="zu-sl-title">思考中\.\.\.<\/span>/);
-  // 子代理：×N 徽标 + 「估」前缀 + dim 数值；无速率时 estdim
+  // 子代理态（v268 已删）：即使旧调用方传入 kind:"subagent"，也不出 ×N 徽标、「估」前缀、估算占位或数值
   const sa = card({ kind: 'subagent', statusText: '子代理运行中', activeCount: 2, speedValue: 268.1, speedIsEstimated: true, noteText: '2 个子代理合计（估算）' });
-  assert.match(sa, /zu-sl-count">×2</);
-  assert.match(sa, /<small class="zu-sl-pre">估<\/small><span class="zu-sl-val dim">268\.1</);
-  assert.match(card({ kind: 'subagent', statusText: '子代理运行中', activeCount: 1, speedValue: null }),
-    /zu-sl-estdim">估算中…</);
-  // 估算：档位色标题/数值 + 胶囊
-  const est = card({ kind: 'estimate', statusText: '生成中（估算）', speedValue: 268.1, band: ok, noteText: '按进度估算' });
-  assert.match(est, /class="zu-sl-title ok"/);
-  assert.match(est, /zu-speed-bandtag/);
+  const saLeft = sa.slice(sa.indexOf('zu-sl-status'), sa.indexOf('2 个子代理合计'));
+  assert.match(saLeft, /<span class="zu-sl-title">子代理运行中<\/span><\/div>/);   // 标题照常
+  assert.doesNotMatch(saLeft, /zu-sl-count|zu-sl-pre|zu-sl-estdim|zu-sl-val|t\/s/);   // 无徽标/估前缀/占位/数值
+  // 生成中（v268：替代原「估算」态——主会话不再实时估算）：闪电图标 + 中性标题 + 计时主读数，无胶囊无数值
+  const wr = card({ kind: 'writing', statusText: '生成中', elapsedText: '47秒', noteText: '正文输出中 · 完成后显示实际速度' });
+  assert.match(wr, /class="ico" viewBox="0 0 24 24"[^>]*><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"\/><\/svg><span class="zu-sl-title">生成中<\/span>/);
+  const wrLeft = wr.slice(wr.indexOf('zu-sl-status'), wr.indexOf('正文输出中'));   // 只看左卡（卡外图例/口径自带 t/s 字样）
+  assert.match(wrLeft, /zu-sl-main"><span class="zu-sl-val">47秒<\/span>/);
+  assert.doesNotMatch(wrLeft, /zu-speed-bandtag|zu-sl-k|t\/s/);
   // 会话均：「均」前缀 + 胶囊
   assert.match(card({ kind: 'avg', statusText: '生成完成', speedValue: 127.6, band: ok, noteText: '会话加权平均' }),
     /zu-sl-pre">均<\/small>.*zu-speed-bandtag/s);

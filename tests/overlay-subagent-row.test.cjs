@@ -4,10 +4,12 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-// v176 子代理行内速率 chip：把 v97 逐槽位估算与泵快照 sub.list 的 tps_avg 投到宿主 v4
-// Agent 工具行（testid 前缀 v4-subagent-open-side-pane- + childSessionId，与槽位键同源）。
+// v176 子代理行内速率 chip：把泵快照 sub.list 的 tps_avg（已完成段真实平均速率）投到
+// 宿主 v4 Agent 工具行（testid 前缀 v4-subagent-open-side-pane- + childSessionId）。
+// v268：原「运行中槽位估算 → 估 X t/s」一态随字符增量估算整体移除——运行中尚无已完成段
+// 的子代理不显示 chip，出现已完成段后直接显示真实平均速率。
 // 夹具：源码切片 + 专用 DOM 桩（前缀选择器/子树类查询/父子链），渲染函数无状态对账的
-// 两态/幂等/串号/摘除/pane 隔离/浅色结构，以及 tooltip 构建器与源码契约。
+// 幂等/串号/摘除/pane 隔离/浅色结构，以及 tooltip 构建器与源码契约。
 
 const NOW = 1730000000000;
 
@@ -72,11 +74,11 @@ function extractTpsBand() {
   return vm.runInNewContext('(function(){' + source.slice(s, e) + '\nreturn tpsBand;})();', {});
 }
 
-/* 渲染切片：SUBROW_TID_PREFIX 起（subRowPaneRoot/subRowDurText/subRowTipHTML/renderSubAgentRows）。
- * 闭包自由变量全部经沙箱全局注入，测试直接改 context 字段驱动两态。 */
+/* 渲染切片：SUBROW_TID_PREFIX 起（subRowPaneRoot/subRowTipHTML/renderSubAgentRows）。
+ * 闭包自由变量全部经沙箱全局注入，测试经 feed() 改写快照数据驱动。 */
 function extractRender(lang) {
   const s = source.indexOf('    var SUBROW_TID_PREFIX = "v4-subagent-open-side-pane-";');
-  const e = source.indexOf('    function subRateTick(', s);
+  const e = source.indexOf('    function sideHandleValid(handle) {', s);
   assert.ok(s >= 0 && e > s, '提取失败: 行内 chip 渲染切片');
   const ctx = vm.createContext({
     L: (zh, en) => (lang === 'en' ? en : zh),
@@ -84,12 +86,8 @@ function extractRender(lang) {
     ttEsc: x => String(x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
     ttRow: (k, v) => '<div class="rt-row"><b>' + k + '</b><span>' + v + '</span></div>',
     fmt: n => String(Math.round(n)),
-    sec: ms => (ms ? (ms / 1000).toFixed(1) + 's' : '–'),
     fmtStart: () => '2026-10-31 10:00',
     fmtStartS: () => '2026-10-31 10:00:05',
-    zuActiveTurnId: snap => (snap && snap.activeTid) || '',
-    DEFAULT_CHARS_PER_TOKEN: 2,
-    bridge: { handle: { charsPerToken: 4 } },
     Date: { now: () => NOW },
     document: {
       documentElement: { classList: { contains: () => true } },   // 深色主题（浅色结构另有源码契约）
@@ -97,7 +95,6 @@ function extractRender(lang) {
     },
     inactive: () => false,
     composer: null, wantedEl: null,
-    subRate: { slots: {} },
     lastSub: null,
     subTipFor: null,
     showSubTip: () => {}, hideSubTip: () => {},
@@ -106,7 +103,7 @@ function extractRender(lang) {
   });
   const fn = vm.runInContext(
     '(function(){' + source.slice(s, e) +
-    '\nreturn { render: renderSubAgentRows, tip: subRowTipHTML, dur: subRowDurText, root: subRowPaneRoot };})();', ctx);
+    '\nreturn { render: renderSubAgentRows, tip: subRowTipHTML, root: subRowPaneRoot };})();', ctx);
   return { ctx, fn };
 }
 
@@ -135,24 +132,32 @@ function makePane(csid) {
   return { root, composer, row, content: row.querySelector('.tool-summary-content') };
 }
 const chipOf = row => row.querySelector('.zu-subrate');
+/* 快照数据：sub.list 里该子代理的已完成段平均速率（0 = 尚无已完成段） */
+function feed(ctx, csid, tpsAvg, extra) {
+  ctx.lastSub = { list: [Object.assign({ sid: csid, tps_avg: tpsAvg }, extra || {})] };
+}
 
 for (const lang of ['zh', 'en']) {
-  const est = lang === 'en' ? 'est ' : '估 ';
 
-  test(`${lang}: running slot renders estimate chip after .tool-summary-content`, () => {
+  test(`${lang}: running sub-agent shows no chip until a completed segment lands, then the real average (v268)`, () => {
     const { ctx, fn } = extractRender(lang);
     const p = makePane('sess_subagent_a');
     ctx.composer = p.composer;
-    ctx.subRate.slots['sess_subagent_a'] = { rate: 45.16, at: NOW - 500 };
+    fn.render();                                   // 快照里还没有这个子代理（刚派发）
+    assert.equal(chipOf(p.row), null, '未入库不显示');
+    feed(ctx, 'sess_subagent_a', 0);               // 已有条目但尚无已完成段
+    fn.render();
+    assert.equal(chipOf(p.row), null, '运行中不估算、不出 chip');
+    feed(ctx, 'sess_subagent_a', 45.16);
     fn.render();
     const chip = chipOf(p.row);
     assert.ok(chip, 'chip mounted');
-    assert.equal(p.row.children.indexOf(chip), p.row.children.indexOf(p.content) + 1, '紧跟摘要行之后');
+    assert.equal(p.row.children.indexOf(chip), p.row.children.indexOf(p.content) + 1, '紧跟能摘行之后');
     assert.equal(chip.className, 'zu-subrate', '深色主题 chip 本体无 zu-light');
     assert.match(chip.innerHTML, /class="warm"/);
-    assert.ok(chip.innerHTML.includes('>' + est + '45.2 t/s<'), '估字头+数值+单位');
+    assert.ok(chip.innerHTML.includes('>45.2 t/s<'), '只有数值+单位，无「估」前缀');
     assert.equal(chip.getAttribute('data-zusage-csid'), 'sess_subagent_a');
-    assert.equal(chip.__zuT.mode, 'est');
+    assert.equal(chip.__zuT.mode, 'real');
     assert.equal(chip.__zuT.rate, '45.2');
     assert.equal(chip.__zuT.title, 'Review 精简模式线');
     assert.equal(typeof chip.__zuT.buildTip, 'function');
@@ -162,7 +167,7 @@ for (const lang of ['zh', 'en']) {
     const { ctx, fn } = extractRender(lang);
     const p = makePane('sess_subagent_a');
     ctx.composer = p.composer;
-    ctx.subRate.slots['sess_subagent_a'] = { rate: 152, at: NOW - 100 };
+    feed(ctx, 'sess_subagent_a', 152);
     fn.render();
     const chip = chipOf(p.row);
     fn.render(); fn.render();
@@ -170,61 +175,47 @@ for (const lang of ['zh', 'en']) {
     assert.equal(p.row.querySelectorAll('.zu-subrate').length, 1);
     assert.match(chip.innerHTML, /class="zu-teal"/);
     // 速率更新 → 原地改字（同节点、同内层结构）
-    ctx.subRate.slots['sess_subagent_a'].rate = 620;
+    feed(ctx, 'sess_subagent_a', 620);
     fn.render();
     assert.equal(chipOf(p.row), chip);
     assert.match(chip.innerHTML, /class="zu-violet"/);   // 500–800 档
-    assert.ok(chip.innerHTML.includes('>' + est + '620.0 t/s<'));
+    assert.ok(chip.innerHTML.includes('>620.0 t/s<'));
   });
 
-  test(`${lang}: thinking phase (null rate) and stale slot (3s gate) show nothing`, () => {
+  test(`${lang}: zero / negative / non-numeric tps_avg shows nothing`, () => {
     const { ctx, fn } = extractRender(lang);
     const p = makePane('sess_subagent_a');
     ctx.composer = p.composer;
-    ctx.subRate.slots['sess_subagent_a'] = { rate: null, at: NOW - 100 };
+    for (const bad of [0, -3, NaN, null, undefined, 'abc', {}]) {
+      feed(ctx, 'sess_subagent_a', bad);
+      fn.render();
+      assert.equal(chipOf(p.row), null, 'tps_avg=' + String(bad) + ' 不显示');
+    }
+    feed(ctx, 'sess_subagent_a', '88');               // 数值字符串归一为数值
     fn.render();
-    assert.equal(chipOf(p.row), null, '思考期隐藏');
-    ctx.subRate.slots['sess_subagent_a'].rate = 90;
-    ctx.subRate.slots['sess_subagent_a'].at = NOW - 4000;
-    fn.render();
-    assert.equal(chipOf(p.row), null, '>3s 过期不显示');
+    assert.ok(chipOf(p.row).innerHTML.includes('>88.0 t/s<'));
   });
 
-  test(`${lang}: completed sub switches to real tps_avg on the same node; removal when data gone`, () => {
+  test(`${lang}: chip follows the snapshot average on the same node; removal when data gone`, () => {
     const { ctx, fn } = extractRender(lang);
     const p = makePane('sess_subagent_a');
     ctx.composer = p.composer;
-    ctx.subRate.slots['sess_subagent_a'] = { rate: 45.16, at: NOW - 500 };
+    feed(ctx, 'sess_subagent_a', 45.16, { task: 'Review 精简模式线', agent: 'general-purpose', output: 4350, requests: 6, last: NOW });
     fn.render();
     const chip = chipOf(p.row);
-    ctx.subRate.slots = {};                                  // 槽位收敛
-    ctx.lastSub = { list: [{ sid: 'sess_subagent_a', tps_avg: 88.44, task: 'Review 精简模式线', agent: 'general-purpose', output: 4350, requests: 6, last: NOW }] };
-    fn.render();
-    assert.equal(chipOf(p.row), chip, '同节点切换真实值');
+    assert.ok(chip);
     assert.equal(chip.__zuT.mode, 'real');
-    assert.ok(chip.innerHTML.includes('>88.4 t/s<'), '真实值无估字头');
-    assert.match(chip.innerHTML, /class="ok"/);
+    assert.ok(chip.innerHTML.includes('>45.2 t/s<'), '真实值无估字头');
     ctx.lastSub = null;                                      // 数据消失 → 摘除
     fn.render();
     assert.equal(chipOf(p.row), null, '无数据摘除');
-  });
-
-  test(`${lang}: pump gap between slot detach and sub.list push leaves chip absent (no frozen estimate)`, () => {
-    const { ctx, fn } = extractRender(lang);
-    const p = makePane('sess_subagent_a');
-    ctx.composer = p.composer;
-    ctx.subRate.slots['sess_subagent_a'] = { rate: 45.16, at: NOW - 500 };
-    fn.render();
-    ctx.subRate.slots = {};
-    fn.render();
-    assert.equal(chipOf(p.row), null, '间隙期不保留冻结估算');
   });
 
   test(`${lang}: row testid reassigned to another subagent rewrites chip identity (串号)`, () => {
     const { ctx, fn } = extractRender(lang);
     const p = makePane('sess_subagent_a');
     ctx.composer = p.composer;
-    ctx.subRate.slots['sess_subagent_b'] = { rate: 210, at: NOW - 100 };
+    feed(ctx, 'sess_subagent_b', 210);
     fn.render();
     assert.equal(chipOf(p.row), null, '旧 csid 无数据不挂');
     p.row.setAttribute('data-testid', 'v4-subagent-open-side-pane-sess_subagent_b');
@@ -239,7 +230,7 @@ for (const lang of ['zh', 'en']) {
     const { ctx, fn } = extractRender(lang);
     const p = makePane('sess_subagent_a');
     ctx.composer = p.composer;
-    ctx.subRate.slots['sess_subagent_a'] = { rate: 45.16, at: NOW - 500 };
+    feed(ctx, 'sess_subagent_a', 45.16);
     fn.render();
     chipOf(p.row).remove();                                  // 模拟 React 重挂连带丢弃
     fn.render();
@@ -251,7 +242,7 @@ for (const lang of ['zh', 'en']) {
     const p = makePane('sess_subagent_a');
     p.content.remove();                                      // 空摘要行（宿主 hasSummaryContent=false 分支）
     ctx.composer = p.composer;
-    ctx.subRate.slots['sess_subagent_a'] = { rate: 45.16, at: NOW - 500 };
+    feed(ctx, 'sess_subagent_a', 45.16);
     fn.render();
     const chip = chipOf(p.row);
     assert.ok(chip);
@@ -262,7 +253,7 @@ for (const lang of ['zh', 'en']) {
   test(`${lang}: scan is scoped to this pane's session shell (split-view same session isolation)`, () => {
     const { ctx, fn } = extractRender(lang);
     const a = makePane('sess_subagent_a'), b = makePane('sess_subagent_a');
-    ctx.subRate.slots['sess_subagent_a'] = { rate: 45.16, at: NOW - 500 };
+    feed(ctx, 'sess_subagent_a', 45.16);
     ctx.composer = a.composer;
     fn.render();
     assert.ok(chipOf(a.row), '本 pane 行有 chip');
@@ -281,7 +272,7 @@ for (const lang of ['zh', 'en']) {
     const row = makeRow('sess_subagent_a');
     root.appendChild(row);
     ctx.composer = composer;
-    ctx.subRate.slots['sess_subagent_a'] = { rate: 45.16, at: NOW - 500 };
+    feed(ctx, 'sess_subagent_a', 45.16);
     fn.render();
     assert.equal(chipOf(row), null, '定位不到 pane 壳不写任何 DOM');
   });
@@ -290,7 +281,7 @@ for (const lang of ['zh', 'en']) {
     const { ctx, fn } = extractRender(lang);
     const p = makePane('sess_subagent_a');
     ctx.composer = p.composer;
-    ctx.subRate.slots['sess_subagent_a'] = { rate: 45.16, at: NOW - 500 };
+    feed(ctx, 'sess_subagent_a', 45.16);
     fn.render();
     assert.ok(chipOf(p.row), '开启（默认）时挂载');
     let hidden = 0;
@@ -310,7 +301,7 @@ for (const lang of ['zh', 'en']) {
   test(`${lang}: switch off in one pane never hides another pane's open tooltip`, () => {
     const { ctx, fn } = extractRender(lang);
     const a = makePane('sess_subagent_a'), b = makePane('sess_subagent_a');
-    ctx.subRate.slots['sess_subagent_a'] = { rate: 45.16, at: NOW - 500 };
+    feed(ctx, 'sess_subagent_a', 45.16);
     // 先在 b pane 渲染出 chip 并模拟悬停
     ctx.composer = b.composer;
     fn.render();
@@ -326,33 +317,6 @@ for (const lang of ['zh', 'en']) {
     fn.render();
     assert.ok(chipB.isConnected, 'b pane 的 chip 不受染指');
     assert.equal(hidden, 0, '别的 pane 的悬停浮层不被收起');
-  });
-
-  test(`${lang}: subRowDurText zh/en segment rules (紧邻中文 / 英文数字留空格)`, () => {
-    const { fn } = extractRender(lang);
-    assert.equal(fn.dur(95000), lang === 'en' ? '1m 35s' : '1分35秒');
-    assert.equal(fn.dur(5000), lang === 'en' ? '5s' : '5秒');
-    assert.equal(fn.dur(60000), lang === 'en' ? '1m' : '1分');
-    assert.equal(fn.dur(400), '0.4s');                       // <1s 走 sec()
-  });
-
-  test(`${lang}: estimate tooltip — elapsed time, calibrated output, escaping`, () => {
-    const { ctx, fn } = extractRender(lang);
-    const p = makePane('sess_subagent_a');
-    ctx.composer = p.composer;
-    ctx.subRate.slots['sess_subagent_a'] = {
-      rate: 45.16, at: NOW - 500, calib: null,
-      store: { getState: () => ({ snapshot: { activeTid: 't1' } }) },
-      tracker: { get: id => (id === 't1' ? { startedAt: NOW - 95000, totalCharacters: 8800, complete: false } : null) },
-    };
-    fn.render();
-    const html = fn.tip(chipOf(p.row).__zuT);
-    assert.match(html, /zusage-subrate-tip \.rt-row/);       // 作用域样式随内容走
-    assert.match(html, /Review 精简模式线/);                  // 行 title 兜底名
-    assert.match(html, new RegExp('<b>' + (lang === 'en' ? 'Estimate' : '估速') + '</b><span>45.2 t/s'));
-    assert.match(html, new RegExp((lang === 'en' ? 'Running for' : '已运行') + '</b><span>' + (lang === 'en' ? '1m 35s' : '1分35秒')));
-    assert.match(html, /≈2200 token/);                       // 8800 字符 ÷ 主桥 c2t 4
-    assert.match(html, lang === 'en' ? /Text-delta estimate/ : /字符增量估算/);
   });
 
   test(`${lang}: real tooltip — task name, agent, output/requests/last; hostile task escaped`, () => {
@@ -390,7 +354,7 @@ for (const lang of ['zh', 'en']) {
 
 test('light theme structure: band class rides inner span, zu-light on chip body (descendant selectors)', () => {
   const s = source.indexOf('    var SUBROW_TID_PREFIX = "v4-subagent-open-side-pane-";');
-  const e = source.indexOf('    function subRateTick(', s);
+  const e = source.indexOf('    function sideHandleValid(handle) {', s);
   const slice = source.slice(s, e);
   assert.match(slice, /var cls = "zu-subrate" \+ \(dark \? "" : " zu-light"\)/);
   assert.match(slice, /'<span class="' \+ bandCls \+ '">'/);
@@ -406,8 +370,8 @@ test('source contracts: updateLive hook, scan cleanup, delegation listener, CSS 
   assert.match(source, /var VERSION = "v\d+"/);   // 版本行在位即可，具体号随提交递增（v259/v260 起不再逐版改钉，旧 v258 硬钉在 HEAD 上已红两个版本）   // v254 = 宿主顶部 48px [app-region:drag] 拖拽条穿透浮层，设置面板头部 ✕ 点击被窗口拖拽吞掉；.zusage-panel/.tip/.zu-mp-ov/.zu-compact-dlg/.zusage-exc 浮层根显式 no-drag（宿主自家浮层同款修法）；v253 = 本轮/今日合计 tooltip 模型明细改项目卡式四列表格（zu-pj-mhead+statTable，费用列随 state.cost 门控；本轮 rt-models 行式退役，精简摘要保留）+ 本轮 tooltip 删「速度＝Σ…未参与测速」口径行（unrated_output 字段照旧生产）；v252 = 模型拉取同步提供商侧配置（issue #236：零兄弟 api-key 供应商首拉写实最小骨架+有据元数据（contextWindow/inputFormat/档位/输出上限，稀疏个人规则 map 继承内置 apiType catch-all），档位按强度梯排序（宿主默认档=values 末项），Copilot capabilities 别名，api.json 档位目录（reasoning_options→effort 词表）缺证据时按需后台补缺（轻量索引落运行目录 24h stale-while-revalidate 跨重启复用，补拉中行内状态+脚注说明），套餐源接目录补缺，弹窗行「未获取配置」中性提示+脚注披露只增不覆盖）；v251 = 套餐额度显示口径开关（⚙「显示剩余额度」，zusage3.quotaRemain 缺省关=已用）：chip 面分段数字与 aria、tooltip 窗口行/Key 总额度行/其他源摘要行改按剩余%（100−已用，同一窗口池补数）打头，绝对值窗口行内已用/剩余明细互换顺序，档位色恒按已用原始值判定，余额/Key 剩余额度/团队/未配置形态不受影响）；v250 = 速度柱状图按轮聚合+悬停卡全格式时间与轮明细+柱间距收紧（zusage _speed_segments 按 turn_id 合并一次提问的全部请求：v=Σ有效输出÷Σ生成窗口，随段携带 m/i/o/n/c；悬停信息卡渲染 模型/Token 用量（含输入·输出拆分）/请求次数/预估费用 + yyyy-MM-dd HH:mm:ss，明细行数参与 CARD_H 校准，X 轴每标签恒带月日，柱宽 calc(20%+12px)=柱白精确收紧 20%，段→轮措辞；编号顺延避让已合入的 v249「点击激活简化」PR #224）；v248 = 预估费用说明气泡「当前模型」随卡携带模型上下文（上一会话已完成、已部署未提交，随本批补录入库）；  // v179/v180 review P1：调用侧形状锁——showSubTip 以数据包调 buildTip（v178 回归即红）
   assert.ok(source.includes('el.__zuT.buildTip(el.__zuT)'), 'tooltip 数据包调用约定');
   assert.ok(source.includes("runningSubagents.length - 1"), '截断从尾部取（最新派发优先）');
-  assert.match(source, /__zusageAcquireConversationStore/, '桥 v2 acquire 访问器消费点');
-  assert.match(source, /sid\.indexOf\("sess_subagent_"\) !== 0/, 'acquire 限子代理前缀');
+  // v268：不再为子代理 acquire/订阅会话 store
+  assert.doesNotMatch(source, /zuAcquireSubStore|acquire\(out\)|charsPerToken|subRate\.slots/);
   // 委托 mouseout 不得把移入浮层当作离开（提示 180ms 延迟收起与 tpsTip 同款）
   assert.match(source, /subTip\.contains\(to\)/);
 });

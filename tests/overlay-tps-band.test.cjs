@@ -5,7 +5,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 // v127（桌面）/ v94（web）：tok/s 速度十档色。TPS_BANDS 是阈值/类名/文案的唯一事实源，
-// 按**原始速度值**分档（含下限、不含上限），生成中估算与完成态真实值同表；
+// 按**原始速度值**分档（含下限、不含上限），web 生成中估算与完成态真实值同表（桌面 v268 起生成中不估算）；
 // 无效值（负数/NaN/±Infinity）一律中性 dim 或整枚 chip 回退，绝不判成低速。
 // 桌面与 web 同源语义，两文件同测；CSS 漂移检查保证 JS 类名与样式定义不脱钩。
 
@@ -28,10 +28,11 @@ function extract(file, lang) {
 }
 
 function completedView(api, tokenRate) {
-  return api.zuBarSpeedView({ complete: true, observedLive: true, outputTokens: 100, tokenRate }, 2);
+  // v268：桌面版第二参已是 sessAvg（web 仍是 charsPerToken）——共用辅助统一传 undefined
+  return api.zuBarSpeedView({ complete: true, observedLive: true, outputTokens: 100, tokenRate }, undefined);
 }
 function estimateView(api, characterRate) {
-  return api.zuBarSpeedView({ complete: false, characterRate, phase: 'writing' }, 2);
+  return api.zuBarSpeedView({ complete: false, characterRate, phase: 'writing' }, undefined);
 }
 
 for (const file of FILES) {
@@ -59,23 +60,42 @@ for (const file of FILES) {
       }
     });
 
-    test(`${file}/${lang}: 估算态同表分档，无效估算保持中性 dim`, () => {
-      assert.equal(estimateView(api, 600).cls, 'zu-azure');      // 600/2 = 300 → 高速
-      assert.equal(estimateView(api, 599).cls, 'zu-sky');        // 299.5 → 快速
-      assert.equal(estimateView(api, 8000).cls, 'zu-ultra');     // 4000 → Ultra
-      assert.equal(estimateView(api, 20).cls, 'hot');            // 10 → 低速（估算也分档）
-      for (const v of [-5, NaN, Infinity]) {
-        const view = estimateView(api, v);
-        assert.equal(view.cls, 'dim', String(v));
-        assert.equal(view.band, null, String(v));
-        assert.equal(view.phase, 'writing');
-      }
-    });
+    if (file === 'overlay.js') {
+      // v268：桌面版生成中不再估算 t/s——最后活动行是正文即「生成中」状态词（中性 dim +
+      // 已用时），characterRate 传入任何值都不出数字；web/overlay.js 是独立实现，保留估算。
+      test(`${file}/${lang}: 生成中不估算（v268）——只有状态词 + 已用时，恒中性 dim`, () => {
+        for (const v of [600, 599, 20, -5, NaN, Infinity, null, undefined]) {
+          const view = estimateView(api, v);
+          assert.equal(view.cls, 'dim', String(v));
+          assert.equal(view.band, undefined, String(v));
+          assert.equal(view.phase, 'writing');
+          assert.equal(view.kind, 'writing');
+          assert.equal(view.speedValue, undefined, String(v));
+          assert.equal(view.word, true);
+          assert.equal(view.text, lang === 'en' ? 'generating…0s' : '生成中…0秒');   // 无 startedAt/observedMs 时回退 0
+          assert.equal(view.elapsedText, lang === 'en' ? '0s' : '0秒');
+          assert.doesNotMatch(view.text, /t\/s/);
+        }
+      });
+    } else {
+      test(`${file}/${lang}: 估算态同表分档，无效估算保持中性 dim`, () => {
+        assert.equal(estimateView(api, 600).cls, 'zu-azure');      // 600/2 = 300 → 高速
+        assert.equal(estimateView(api, 599).cls, 'zu-sky');        // 299.5 → 快速
+        assert.equal(estimateView(api, 8000).cls, 'zu-ultra');     // 4000 → Ultra
+        assert.equal(estimateView(api, 20).cls, 'hot');            // 10 → 低速（估算也分档）
+        for (const v of [-5, NaN, Infinity]) {
+          const view = estimateView(api, v);
+          assert.equal(view.cls, 'dim', String(v));
+          assert.equal(view.band, null, String(v));
+          assert.equal(view.phase, 'writing');
+        }
+      });
+    }
 
     test(`${file}/${lang}: 状态词阶段（思考中/工具）不分档维持 dim`, () => {
-      assert.equal(api.zuBarSpeedView({ complete: false, characterRate: null, observedMs: 1000 }, 2).cls, 'dim');
+      assert.equal(api.zuBarSpeedView({ complete: false, characterRate: null, observedMs: 1000 }, undefined).cls, 'dim');
       const tool = api.zuBarSpeedView(
-        { complete: false, characterRate: null, runningTool: { name: 'Read', startedAt: 10000 } }, 2);
+        { complete: false, characterRate: null, runningTool: { name: 'Read', startedAt: 10000 } }, undefined);
       assert.equal(tool.cls, 'dim');
       assert.equal(tool.band, undefined);
     });
@@ -156,18 +176,18 @@ for (const lang of ['zh', 'en']) {
   const prefix = lang === 'en' ? 'avg ' : '均';
 
   test(`overlay/${lang}: 完成态主数字=会话均，按均值分档，最近一轮进 latest`, () => {
-    const view = desktop.zuBarSpeedView(stats, 2, null, 85.5);
+    const view = desktop.zuBarSpeedView(stats, 85.5);
     assert.equal(view.text, `${prefix}85.5 t/s`);
     assert.equal(view.cls, 'ok');          // 85.5 落 ok 档，而非最近一轮 49.9 的 warm 档
     assert.equal(view.latest, 49.9);
     assert.equal(view.phase, null);
-    const whole = desktop.zuBarSpeedView(stats, 2, null, 85);
+    const whole = desktop.zuBarSpeedView(stats, 85);
     assert.equal(whole.text, `${prefix}85 t/s`);   // 整数不带 .0
   });
 
   test(`overlay/${lang}: 会话均缺席/非正数回退原完成态行为`, () => {
     for (const avg of [undefined, null, 0, -5, NaN, Infinity]) {
-      const view = desktop.zuBarSpeedView(stats, 2, null, avg);
+      const view = desktop.zuBarSpeedView(stats, avg);
       assert.equal(view.text, '49.9 t/s');
       assert.equal(view.latest, undefined);
       assert.equal(view.cls, 'warm');

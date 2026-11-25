@@ -28,7 +28,7 @@ Install only if you understand and accept the above. Not recommended on managed/
    Speed        This turn                    Session total          Tools     Today   Subagents  Settings
 ```
 
-- **Speed**: t/s; a character-based estimate while generating, switching to measured stats after the request completes
+- **Speed**: t/s; status and elapsed time while generating (no live estimate, for sub-agents too), switching to measured stats after the request completes
 - **This turn**: tokens, cache-hit rate, request count, total duration, TTFT; hover for input/output/cache/thinking breakdown and estimated cost
 - **Session total / Today**: this conversation / all conversations today (hover for details)
 - **Tools**: call count, red badge on errors, hover for per-tool durations and errors

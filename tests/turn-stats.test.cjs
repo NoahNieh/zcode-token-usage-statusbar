@@ -10,17 +10,21 @@ function header(state = 'running', extra = {}) {
 }
 function text(value) { return { rowId: 2, turnId: 't', kind: 'assistantText', text: value }; }
 
-test('counts visible text, reasoning and tool input without counting tool output', () => {
+test('no character sampling (v268): phase/tool state only, no live rate, no char fields', () => {
   let now = 0;
   const tracker = createTracker({ now: () => now });
-  tracker.ingest(snapshot(1, [header(), text('a')]));
+  tracker.ingest(snapshot(1, [header(), text('abc')]));
   now = 1000;
-  tracker.ingest(snapshot(2, [header(), text('abc'),
-    { rowId: 3, turnId: 't', kind: 'reasoning', text: '想' },
-    { rowId: 4, turnId: 't', kind: 'toolCall', inputText: '{}', output: 'not model output' }]));
-  assert.equal(tracker.get('t').characterRate, 5);
-  assert.equal(tracker.get('t').tokenRate, null);
-  assert.match(format(tracker.get('t')), /字符\/s/);
+  tracker.ingest(snapshot(2, [header(), text('abcdefgh')]));
+  const live = tracker.get('t');
+  assert.equal(live.phase, 'writing');            // 阶段判定（思考/工具/正文）不依赖字符采样
+  assert.equal('characterRate' in live, false);   // 不再有运行期速率字段
+  assert.equal('totalCharacters' in live, false);
+  assert.doesNotMatch(format(live), /字符\/s/);   // 生成中行不带字符速率
+  assert.match(format(live), /^⚡ 生成中 · 已观察 1\.0s$/);
+  // 文本里出现任何字符都不触发额外工作/字段：长文本与短文本的产出形状一致
+  tracker.ingest(snapshot(3, [header(), text('字'.repeat(20000))]));
+  assert.deepEqual(Object.keys(tracker.get('t')).sort(), Object.keys(live).sort());
 });
 
 test('duplicate and old snapshots do not increment counts', () => {
@@ -102,30 +106,6 @@ test('unavailable interfaces are rejected', () => {
   assert.equal(subscribeStore({}, createTracker(), () => {}), null);
 });
 
-test('removed rows reset the live rate instead of retaining old characters', () => {
-  let now = 0;
-  const tracker = createTracker({ now: () => now });
-  tracker.ingest(snapshot(1, [header(), text('abc')]));
-  now = 1000;
-  tracker.ingest(snapshot(2, [header(), text('abcdef')]));
-  assert.equal(tracker.get('t').characterRate, 3);
-  now = 1500;
-  tracker.ingest(snapshot(3, [header(), text('a')]));
-  assert.equal(tracker.get('t').characterRate, null);
-  tracker.ingest(snapshot(4, []));
-  assert.equal(tracker.get('t'), null);
-});
-
-test('live speed does not stay stale indefinitely when output stops', () => {
-  let now = 0;
-  const tracker = createTracker({ now: () => now });
-  tracker.ingest(snapshot(1, [header(), text('a')]));
-  now = 1000;
-  tracker.ingest(snapshot(2, [header(), text('abc')]));
-  now = 4000;
-  assert.equal(tracker.get('t').characterRate, null);
-});
-
 test('tracker is disposed even when the host unsubscribe throws', () => {
   const tracker = createTracker({ now: () => 0 });
   const close = subscribeStore({
@@ -135,18 +115,6 @@ test('tracker is disposed even when the host unsubscribe throws', () => {
   assert.throws(close, /closed host/);
   assert.equal(tracker.get('t'), null);
   assert.doesNotThrow(close);
-});
-
-test('totalCharacters exposes the running cumulative count for caller-side chars-to-token calibration', () => {
-  let now = 0;
-  const tracker = createTracker({ now: () => now });
-  tracker.ingest(snapshot(1, [header(), text('abc')]));
-  assert.equal(tracker.get('t').totalCharacters, 3);
-  now = 1000;
-  tracker.ingest(snapshot(2, [header(), text('abcdefgh')]));
-  assert.equal(tracker.get('t').totalCharacters, 8);
-  tracker.ingest(snapshot(3, [header('completedSuccess', { outputTokens: 4, modelDurationMs: 1000 })]));
-  assert.equal(tracker.get('t').totalCharacters, 0);   // 正文行被移除后累计清零，不冒充已消失的内容
 });
 
 test('runningTool is recomputed from surviving rows, never stuck on a row that slid out of the window', () => {

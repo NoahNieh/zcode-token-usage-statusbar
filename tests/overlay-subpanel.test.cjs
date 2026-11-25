@@ -6,7 +6,7 @@ const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'overlay.js'), 'utf8');
 const start = source.indexOf('    function positionSubPop() {');
-const end = source.indexOf('    var subRateTimer = 0;', start);
+const end = source.indexOf('    /* 数据推送跟随（render 两路径共用）', start);
 assert.ok(start >= 0 && end > start, 'positionSubPop slice found');
 const positionSource = source.slice(start, end);
 
@@ -83,7 +83,7 @@ test('zero-rect entry falls back to the bar anchor; a detached entry closes the 
   function runBuild(panel, sub, sel, over) {
     const ctx = {
       subPopSel: sel || '', subPopMode: 'pinned', subPopSig: panel.__zuSig || '',
-      subPanel: panel, subRate: { slots: {} }, state: { cost: 1 },
+      subPanel: panel, subLive: { sids: {} }, state: { cost: 1 },
       pickedSid: 'sid_main', subPopSess: 'sid_main',
       L: (a) => a, ttEsc: (a) => String(a), escAttr: (a) => String(a),
       fmt: () => '1', countFmt: () => '1', fmtMoney: () => '¥1', fmtTime: () => '12:00', fmtStartS: () => '2026-01-01 00:00:00',
@@ -95,7 +95,7 @@ test('zero-rect entry falls back to the bar anchor; a detached entry closes the 
       tpsBand: () => null, FXQ_ICON: '<svg class="tip-fxq"></svg>',
       fxqIcon: (models, scope) => '<svg class="tip-fxq" data-mcount="' + (models ? models.length : 0) + '" data-mscope="' + scope + '"></svg>',   // v248：KPI 问号随卡携带模型上下文（实例闭包函数，切片外桩）
       subPopIco: () => '<svg></svg>',
-      subRateSlotText: () => 'est', JSON,
+      JSON,
       ...(over || {}),
     };
     ctx.subPopSel = (panel.__zuSel = sel !== undefined ? sel : (panel.__zuSel || ''));

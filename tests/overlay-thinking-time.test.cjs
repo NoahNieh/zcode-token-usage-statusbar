@@ -30,7 +30,8 @@ const cases = [
 
 for (const file of ['overlay.js', 'web/overlay.js']) {
   const source = fs.readFileSync(path.join(__dirname, '..', file), 'utf8');
-  const start = source.indexOf('  var DEFAULT_CHARS_PER_TOKEN = 2;');
+  // v268：桌面版 DEFAULT_CHARS_PER_TOKEN 已删，切片起点改到档位表注释；web/overlay.js 独立实现仍保留估算
+  const start = source.indexOf(file === 'overlay.js' ? '  /* v127 tok/s 十档色' : '  var DEFAULT_CHARS_PER_TOKEN = 2;');
   const end = source.indexOf('  /* 思考态动效图标', start);
   assert.ok(start >= 0 && end > start, `提取失败: ${file} zuBarSpeedView`);
 
@@ -56,7 +57,8 @@ for (const file of ['overlay.js', 'web/overlay.js']) {
 test('overlay.js & web/overlay.js: thinking timer anchors to startedAt when present, falls back to observedMs', () => {
   for (const file of ['overlay.js', 'web/overlay.js']) {
     const source = fs.readFileSync(path.join(__dirname, '..', file), 'utf8');
-    const start = source.indexOf('  var DEFAULT_CHARS_PER_TOKEN = 2;');
+    // v268：桌面版 DEFAULT_CHARS_PER_TOKEN 已删，切片起点改到档位表注释；web/overlay.js 独立实现仍保留估算
+  const start = source.indexOf(file === 'overlay.js' ? '  /* v127 tok/s 十档色' : '  var DEFAULT_CHARS_PER_TOKEN = 2;');
     const end = source.indexOf('  /* 思考态动效图标', start);
     assert.ok(start >= 0 && end > start, `提取失败: ${file} zuBarSpeedView`);
     const NOW = 36610000;   // 固定时钟，避开真实墙钟抖动
