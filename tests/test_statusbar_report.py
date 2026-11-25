@@ -261,6 +261,28 @@ class ReportStatsTests(ReportFixture):
         self.assertEqual(sess[0]["total"], 11)          # in+out
 
 
+    def test_sessions_derived_sessions_do_not_crowd_out_mains(self):
+        """v267：派生会话在 SQL 里先排除再取 10 条——先取后滤会被它们挤占名额。"""
+        for i in range(10):
+            sid = "main%02d" % i
+            self.sess(sid, title="主%d" % i, directory="D:/p%d" % i)
+            self.insert(self.row("m%d" % i, sid=sid, completed=self.at(0) - i * 1000))
+        # 20 个派生会话都比全部主会话更晚完成：旧行为（先取 20 再过滤）下列表为空
+        for i in range(20):
+            sid = ("sess_dwf-x%02d" if i % 2 else "sess_subagent_x%02d") % i
+            self.sess(sid, title="派生%d" % i)
+            self.insert(self.row("d%d" % i, sid=sid, completed=self.at(0) + 60000 - i))
+        sess = zusage._report_stats(self.con)["sessions"]
+        self.assertEqual([s["sid"] for s in sess], ["main%02d" % i for i in range(10)])
+        self.assertTrue(all(s["title"].startswith("主") for s in sess))
+        # CLI 最近会话列表（main_only=False）保持原口径：派生会话照常出现
+        self.assertEqual(len(zusage.recent_sessions(self.con, 5)), 5)
+        self.assertEqual(
+            len(zusage.recent_sessions(self.con, 5, main_only=True)), 5)
+        self.assertTrue(all(not r[0].startswith("sess_")
+                            for r in zusage.recent_sessions(self.con, 5, main_only=True)))
+
+
 class ReportRangeStatsTests(ReportFixture):
     """v265 自选范围/单日聚合（zusage._report_range_stats / _parse_range_dates）。"""
 

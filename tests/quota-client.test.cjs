@@ -113,6 +113,28 @@ test("client: v2-os key unavailable backs off 60s without repeated keyring reads
   assert.equal(client.view().status, "not_configured");
 });
 
+test("client: decryptHostValue serves model-puller plan tokens (v1 sync, v2 warm on demand)", async () => {
+  // v1：默认 env 密钥（与夹具加密同源，同步可解）
+  const v1Client = makeClient({ creds: {} }).client;
+  assert.equal(v1Client.decryptHostValue(encryptValue("plan.v1")), "plan.v1");
+  assert.equal(v1Client.decryptHostValue(""), null);
+  assert.equal(v1Client.decryptHostValue("plain"), "plain");
+  // v2-os：冷缓存 fail-closed 并触发热身，热身后可解；成功后本进程不重读
+  let warmCalls = 0;
+  const v2 = encryptV2("plan.os.v2", OSKEY, "os");
+  const { client } = makeClient({
+    creds: { "oauth:bigmodel:access_token": v2 },
+    env: { ZCODE_CREDENTIAL_SECRET: "" },   // 覆盖为空：走 OS 库路径
+    keyringRead: () => { warmCalls += 1; return Promise.resolve(OSKEY_B64); },
+  });
+  assert.equal(warmCalls, 0, "未见 v2 值不读 OS 库");
+  assert.equal(client.decryptHostValue(v2), null);      // 冷缓存 fail-closed，同时触发热身
+  await flush();                                        // 预热在微任务里拉起读钥
+  assert.equal(warmCalls, 1);
+  assert.equal(client.decryptHostValue(v2), "plan.os.v2");
+  assert.equal(warmCalls, 1);
+});
+
 test("jwtExpMs reads exp; non-JWT yields null", () => {
   const payload = Buffer.from(JSON.stringify({ exp: 1793176110 })).toString("base64url");
   assert.equal(Q.jwtExpMs("h." + payload + ".s"), 1793176110 * 1000);

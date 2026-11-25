@@ -13,6 +13,29 @@ const { createEnginePatcher, ENGINE_TARGETS, PROLOGUE, PROLOGUE_V1, PROLOGUE_PRE
 
 function sha256hex(buf) { return require("crypto").createHash("sha256").update(buf).digest("hex"); }
 
+/* 出厂登记表逐版本锁定判定符号（v267）：表首条目引用 ANCHOR/REPLACEMENT 常量，登记新版本
+ * 滚动常量之前，旧表首必须已转成显式 anchorFor/replacementFor 字面量——否则已打补丁的旧版本
+ * 引擎会被 ensure 误判 patched_inconsistent。登记新版本时在此追加一行。 */
+const FACTORY_SYMBOLS = {
+  "4.0.0": ["$ue", "fZo", "0de95ddd65d7712a3beeccc8ee6de53ea0ce96338eb427e52b2717ba2f3afe19"],
+  "3.19.1": ["Uue", "KKo", "4b90ae046753be9f5ba63dee14b8fd2cdb07b5540e9bfe348ba127504b8cf8da"],
+  "3.17.2": ["cke", "jBo", "d9afd58d694f98a5279bf548cdc7646413c125762e86730605a6071f9e0346d6"],
+  "3.17.1": ["ake", "DBo", "9afd565a104d660259e6bdeeaa5cb8abc74a908559e21aa3c5f6a06f2a9da6c6"],
+};
+
+test("出厂登记表逐版本锁定判定符号：滚动 ANCHOR/REPLACEMENT 不得改写旧条目", () => {
+  // 期望值按符号独立拼出，不经被测模块的 anchorFor/replacementFor：常量被滚动而旧条目没转字面量即红
+  const tail = ";return (globalThis." + MARK + "&&globalThis." + MARK + "(t,n))??Math.max(0,t-n)";
+  const pinned = ENGINE_TARGETS.filter((t) => FACTORY_SYMBOLS[t.build]);
+  assert.deepEqual(pinned.map((t) => t.build), Object.keys(FACTORY_SYMBOLS));
+  for (const t of pinned) {
+    const [fn, dflt, sha] = FACTORY_SYMBOLS[t.build];
+    assert.equal(t.engineSha256, sha, t.build);
+    assert.equal(t.anchor, "n=" + fn + "(e.bufferTokens)??" + dflt + ";return Math.max(0,t-n)", t.build);
+    assert.equal(t.replacement, "n=" + fn + "(e.bufferTokens)??" + dflt + tail, t.build);
+  }
+});
+
 function makeFixture(opts = {}) {
   const anchor = opts.anchor || ANCHOR;
   return Buffer.from(
@@ -60,6 +83,29 @@ function registerTarget(buf, anchor, replacement) {
   extraTargets.push(t);
   return t;
 }
+
+test("ensure keeps a per-version backup: stale older-version backup does not suppress the current one", () => {
+  const s = setup();
+  try {
+    const engineDir = path.dirname(s.enginePath);
+    const original = s.original;
+    registerTarget(original);
+    // 客户端升级场景：目录里已有上一版引擎的备份（内容与当前原版不同）
+    const stale = path.join(engineDir, ".pre-acthreshold-stale-2026-01-01T00-00-00-000Z");
+    fs.writeFileSync(stale, Buffer.from("#!/usr/bin/env node\n\"use strict\";var old=1;\n"));
+    assert.equal(s.patcher.ensure(), "applied");
+    const backups = fs.readdirSync(engineDir).filter((f) => f.startsWith(".pre-acthreshold-"));
+    const matching = backups.filter((f) => fs.readFileSync(path.join(engineDir, f)).equals(original));
+    assert.equal(matching.length, 1, "当前版本原版必须留底");
+    assert.ok(backups.includes(path.basename(stale)), "旧版备份不删除");
+    // 幂等重跑：已是 applied，不再新增备份
+    assert.equal(s.patcher.ensure(), "applied");
+    assert.equal(fs.readdirSync(engineDir).filter((f) => f.startsWith(".pre-acthreshold-")).length,
+      backups.length);
+  } finally {
+    s.cleanup();
+  }
+});
 
 test("ensure applies prologue+replacement, leaves backup and sentinel, idempotent on re-run", () => {
   const s = setup();

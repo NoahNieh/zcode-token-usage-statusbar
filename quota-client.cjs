@@ -2267,6 +2267,14 @@ function createQuotaClient(opts) {
       }
       return list;
     },
+    /* v267：宿主凭据解密的对外出口（model-puller 套餐源用，替代只认 v1 的两参调用）。
+     * v1 同步可解；v2 需主密钥——首次见到 v2 值按需置需求并预热，冷缓存本次返回 null，
+     * 调用方下次操作重试即得。解出的明文只在内存流转，不进日志/诊断。 */
+    decryptHostValue(enc) {
+      if (typeof enc !== "string" || !enc) return null;
+      if (enc.startsWith(ENC2_PREFIX)) { cipherDemand = true; warmCipher(); }
+      return decryptValue(enc, deriveCipherKey(env), j.cipherKeys);
+    },
     secretsPath,
     dispose() {
       for (const st of states.values()) {

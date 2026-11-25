@@ -128,6 +128,7 @@ function harness({ prefs = {} } = {}) {
   }
   const panel = () => body.children.find(e => e.classList && e.classList.contains && e.classList.contains('zu-settings'));
   const repBody = () => panel().querySelector('.zu-rep-body');
+  const repTools = () => panel().querySelector('.zu-rep-tools');
   function clickTab(view) {
     const tab = new Element('button');
     tab.setAttribute('data-rep-view', view);
@@ -135,7 +136,7 @@ function harness({ prefs = {} } = {}) {
     for (const fn of panel().listeners.get('click') || []) fn(evt);
     return tab;
   }
-  return { window, body, inject, boot, tick, flushTimeout, buildComposer, payload, panel, repBody, clickTab, state: () => window.quotaTest.state() };
+  return { window, body, document, inject, boot, tick, flushTimeout, buildComposer, payload, panel, repBody, repTools, clickTab, state: () => window.quotaTest.state() };
 }
 
 const NOW = 1_799_000_000_000;
@@ -347,8 +348,9 @@ test('custom view: default range request, loading, then card + daily trend', () 
   assert.ok(req.from <= req.to, 'default range is ordered');
   const loadingHtml = h.repBody().innerHTML;
   assert.ok(loadingHtml.includes('正在查询'), 'loading state');
-  assert.ok(loadingHtml.includes('zu-rep-from'), 'start date input rendered');
-  assert.ok(loadingHtml.includes('zu-rep-to'), 'end date input rendered');
+  const toolsHtml = h.repTools().innerHTML;
+  assert.ok(toolsHtml.includes('zu-rep-from'), 'start date input rendered');
+  assert.ok(toolsHtml.includes('zu-rep-to'), 'end date input rendered');
 
   const days = [];
   for (let i = 6; i >= 0; i--) days.push({ d: 'day' + i, date: isoAdd(req.to, -i), requests: 1, total: 100 });
@@ -374,11 +376,13 @@ test('custom view: date change requests the picked range; inverted range shows a
 
   const pickedTo = isoAdd(first.from, -10);   // 早于默认 from → 倒序
   sendChange(h, 'zu-rep-to', pickedTo);
+  h.flushTimeout(300);                        // v267：change 走 300ms 防抖
   assert.equal(rangeReq(h).length, 1, 'no request for an inverted range');
   assert.ok(h.repBody().innerHTML.includes('开始日期不能晚于结束日期'), 'order problem note');
 
   const pickedFrom = isoAdd(pickedTo, -5);
   sendChange(h, 'zu-rep-from', pickedFrom);
+  h.flushTimeout(300);
   const reqs = rangeReq(h);
   assert.equal(reqs.length, 2, 'valid range issues one request');
   assert.equal(reqs[1].from, pickedFrom);
@@ -393,8 +397,167 @@ test('custom view: >366 days is rejected locally without a request', () => {
   h.window.__zusagePluginResult({ id: first.requestId, ok: true, from: first.from, to: first.to,
     totals: TOTALS(), models: [ROW()], days: [] });
   sendChange(h, 'zu-rep-from', isoAdd(first.to, -400));
+  h.flushTimeout(300);
   assert.equal(rangeReq(h).length, 1, 'no request for a >366-day range');
   assert.ok(h.repBody().innerHTML.includes('单次最多查询 366 天'), 'range-too-long note');
+});
+
+test('custom view: future dates are rejected locally without a request', () => {
+  const h = harness(); setup(h);
+  h.window.__zusageUpdate(h.payload(STATS()));
+  h.clickTab('custom');
+  const first = rangeReq(h)[0];
+  h.window.__zusagePluginResult({ id: first.requestId, ok: true, from: first.from, to: first.to,
+    totals: TOTALS(), models: [ROW()], days: [] });
+  sendChange(h, 'zu-rep-to', isoAdd(localTodayIso(), 5));
+  h.flushTimeout(300);
+  assert.equal(rangeReq(h).length, 1, 'no request for a future range');
+  assert.ok(h.repBody().innerHTML.includes('不能选择未来的日期'), 'future problem note');
+});
+
+test('custom view: rapid keystrokes collapse into one debounced query', () => {
+  const h = harness(); setup(h);
+  h.window.__zusageUpdate(h.payload(STATS()));
+  h.clickTab('custom');
+  const first = rangeReq(h)[0];
+  h.window.__zusagePluginResult({ id: first.requestId, ok: true, from: first.from, to: first.to,
+    totals: TOTALS(), models: [ROW()], days: [] });
+  // Chromium 日期框逐键触发 change：防抖期内不得发查询，暂停后只发一次且用终值
+  sendChange(h, 'zu-rep-from', isoAdd(first.to, -3));
+  sendChange(h, 'zu-rep-from', isoAdd(first.to, -2));
+  sendChange(h, 'zu-rep-from', isoAdd(first.to, -1));
+  assert.equal(rangeReq(h).length, 1, 'no request while typing');
+  h.flushTimeout(300);
+  const reqs = rangeReq(h);
+  assert.equal(reqs.length, 2, 'exactly one request after the pause');
+  assert.equal(reqs[1].from, isoAdd(first.to, -1), 'final value wins');
+});
+
+test('custom view: snapshot updates during typing neither query nor repaint the body', () => {
+  const h = harness(); setup(h);
+  h.window.__zusageUpdate(h.payload(STATS()));
+  h.clickTab('custom');
+  const first = rangeReq(h)[0];
+  h.window.__zusagePluginResult({ id: first.requestId, ok: true, from: first.from, to: first.to,
+    totals: TOTALS(), models: [ROW()], days: [] });
+  const bodyBefore = h.repBody().innerHTML;
+  sendChange(h, 'zu-rep-from', isoAdd(first.to, -1));
+  h.window.__zusageUpdate(h.payload(STATS()));   // 键入期间到达的快照推送
+  assert.equal(rangeReq(h).length, 1, 'no intermediate query');
+  assert.equal(h.repBody().innerHTML, bodyBefore, 'body untouched while typing');
+  h.flushTimeout(300);
+  assert.equal(rangeReq(h).length, 2);
+});
+
+test('custom view: focused date input keeps the toolbar DOM while the result renders', () => {
+  const h = harness(); setup(h);
+  h.window.__zusageUpdate(h.payload(STATS()));
+  h.clickTab('custom');
+  const first = rangeReq(h)[0];
+  h.window.__zusagePluginResult({ id: first.requestId, ok: true, from: first.from, to: first.to,
+    totals: TOTALS(), models: [ROW()], days: [] });
+  // 模拟焦点在 from 日期框上（生产 DOM：输入在 .zu-rep-tools 容器内）：防抖结束后的那次
+  // sync 也不得替换工具栏（否则焦点落回年字段）。夹具挂错容器曾让本用例假绿。
+  const input = new Element('input');
+  input.className = 'zu-rep-from';
+  input.value = isoAdd(first.to, -1);
+  h.repTools().appendChild(input);
+  h.document.activeElement = input;
+  const toolsBefore = h.repTools().innerHTML;
+  for (const fn of h.panel().listeners.get('change') || []) fn({ target: input });
+  h.flushTimeout(300);
+  assert.equal(rangeReq(h).length, 2, 'query issued after the debounce');
+  assert.equal(h.repTools().innerHTML, toolsBefore, 'toolbar DOM untouched while the date input has focus');
+  assert.ok(h.repBody().innerHTML.includes('正在查询'), 'body still updates');
+});
+
+test('custom view: entering via a trend bar still treats the range as initialized', () => {
+  const h = harness(); setup(h);
+  const s = STATS();
+  const dayIso = isoAdd(localTodayIso(), -2);
+  s.days[29].date = dayIso;
+  s.days[29].requests = 10;
+  s.days[29].total = 300;
+  h.window.__zusageUpdate(h.payload(s));
+  h.clickTab('d7');
+  const bar = { getAttribute: k => (k === 'data-rep-day' ? dayIso : null) };
+  for (const fn of h.panel().listeners.get('click') || []) fn({ target: { closest: sel => (sel === '.zu-rep-bar' ? bar : null) } });
+  assert.equal(h.state().repView, 'custom');
+  assert.equal(h.state().repCustomInit, 1, 'bar entry also marks the custom view initialized');
+  sendChange(h, 'zu-rep-from', '');
+  sendChange(h, 'zu-rep-to', '');
+  h.flushTimeout(300);
+  assert.equal(h.state().repFrom, '', 'no silent default refill after bar entry');
+  assert.ok(h.repBody().innerHTML.includes('请选择有效的开始和结束日期'), 'validation prompt');
+});
+
+test('custom view: a timed-out request that lands late does not cancel the replacement guard', () => {
+  const h = harness(); setup(h);
+  h.window.__zusageUpdate(h.payload(STATS()));
+  h.clickTab('custom');
+  const req1 = rangeReq(h)[0];
+  h.flushTimeout(12000);                        // 超时：loading 复位
+  assert.ok(h.repBody().innerHTML.includes('查询超时'), 'timeout guidance');
+  const click = { target: { closest: sel => (sel === '.zu-rep-refresh' ? {} : null) } };
+  for (const fn of h.panel().listeners.get('click') || []) fn(click);   // 同 key 重发
+  assert.equal(rangeReq(h).length, 2);
+  assert.equal(h.state().repRangeLoading, true);
+  h.window.__zusagePluginResult({ id: req1.requestId, ok: true, from: req1.from, to: req1.to,
+    totals: TOTALS(), models: [ROW()], days: [] });   // 旧回执迟到
+  assert.equal(h.state().repRangeLoading, true, 'late old reply must not settle the new request');
+  h.flushTimeout(12000);
+  assert.ok(h.repBody().innerHTML.includes('查询超时'), 'new request keeps its own timeout guard');
+});
+
+test('custom view: refresh button ignores clicks while a query is in flight', () => {
+  const h = harness(); setup(h);
+  h.window.__zusageUpdate(h.payload(STATS()));
+  h.clickTab('custom');
+  assert.equal(rangeReq(h).length, 1);
+  const click = { target: { closest: sel => (sel === '.zu-rep-refresh' ? {} : null) } };
+  for (const fn of h.panel().listeners.get('click') || []) fn(click);
+  assert.equal(rangeReq(h).length, 1, 'in-flight refresh click is ignored');
+  const req = rangeReq(h)[0];
+  h.window.__zusagePluginResult({ id: req.requestId, ok: true, from: req.from, to: req.to,
+    totals: TOTALS(), models: [ROW()], days: [] });
+  for (const fn of h.panel().listeners.get('click') || []) fn(click);
+  assert.equal(rangeReq(h).length, 2, 'refresh works once the query settled');
+});
+
+test('custom view: clearing both dates asks for a range instead of restoring the default', () => {
+  const h = harness(); setup(h);
+  h.window.__zusageUpdate(h.payload(STATS()));
+  h.clickTab('custom');
+  const first = rangeReq(h)[0];
+  h.window.__zusagePluginResult({ id: first.requestId, ok: true, from: first.from, to: first.to,
+    totals: TOTALS(), models: [ROW()], days: [] });
+  sendChange(h, 'zu-rep-from', '');
+  sendChange(h, 'zu-rep-to', '');
+  h.flushTimeout(300);
+  assert.equal(rangeReq(h).length, 1, 'no query after clearing both ends');
+  assert.equal(h.state().repFrom, '', 'no silent default refill');
+  assert.ok(h.repBody().innerHTML.includes('请选择有效的开始和结束日期'), 'validation prompt');
+});
+
+test('report cards rebuild when the number-unit switches change', () => {
+  const h = harness(); setup(h);
+  const p = h.payload(STATS());
+  Object.assign(p.recent[0], sessRow());
+  h.window.__zusageUpdate(p);
+  assert.ok(h.repBody().innerHTML.includes('1.2万'), 'zh wan unit by default');
+  const cn = new Element('input');
+  cn.className = 'zu-cn-num';
+  cn.checked = false;   // 关万/亿
+  for (const fn of h.panel().listeners.get('change') || []) fn({ target: cn });
+  assert.ok(h.repBody().innerHTML.includes('12.0K'), 'cnNum off rebuilds with K');
+  cn.checked = true;
+  for (const fn of h.panel().listeners.get('change') || []) fn({ target: cn });
+  assert.ok(h.repBody().innerHTML.includes('1.2万'), 'cnNum back on rebuilds with wan');
+  const kmb = new Element('input');
+  kmb.className = 'zu-force-kmb';
+  kmb.checked = true;
+  for (const fn of h.panel().listeners.get('change') || []) fn({ target: kmb });
+  assert.ok(h.repBody().innerHTML.includes('12.0K'), 'force K/M/B rebuilds the card');
 });
 
 test('clicking a dated daily bar switches to a single-day custom query', () => {

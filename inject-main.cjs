@@ -1011,7 +1011,11 @@ function initModelPuller() {
     modelPuller = createModelPuller({
       customCfgPath: pullPaths.customCfgPath,
       credentialsPath: pullPaths.credsPath,   // v229：迁移后 ~/.zcode/v2/credentials.json 是宿主不读的死目录（issue #205）
-      decryptValue: (enc) => decryptValue(enc, deriveCipherKey(process.env)),   // 套餐源：内存解密，同额度链纪律
+      // v267：套餐源解密走 quota-client 实例（v2 主密钥在其闭包内按需热身、热换后自动换用）；
+      // 实例缺席时退回只认 v1 的同步解密
+      decryptValue: (enc) => (quotaClient && typeof quotaClient.decryptHostValue === "function"
+        ? quotaClient.decryptHostValue(enc)
+        : decryptValue(enc, deriveCipherKey(process.env))),   // 套餐源：内存解密，同额度链纪律
       cachePath: path.join(__dirname, "model-efforts-cache.json"),   // #236：档位索引落运行目录（pricing-cache.json 同款先例），跨重启复用
       log: (...a) => LOG("[model-pull]", ...a),
     });

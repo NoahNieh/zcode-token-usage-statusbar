@@ -384,15 +384,23 @@ def daily_usage(con, days):
     return out
 
 
-def recent_sessions(con, limit=10):
+def recent_sessions(con, limit=10, main_only=False):
+    """最近活跃会话（v267 增 main_only）。
+
+    main_only=True 时在 SQL 里先排除派生会话（Task 子代理 sess_subagent*、动态工作流
+    sess_dwf*，与 _is_sub_session 同前缀）再 LIMIT——先取 N 条再过滤会被派生会话占满
+    名额，用量报表「最近会话」曾因此只剩两三条主会话。"""
+    where = ("substr(m.session_id,1,?)<>'sess_subagent' and substr(m.session_id,1,?)<>'sess_dwf'"
+             if main_only else "1=1")
+    params = (_SUB_PREFIX_LEN, _DWF_PREFIX_LEN, limit) if main_only else (limit,)
     return con.execute(
-        """select s.id, coalesce(s.title,'(无标题)'), coalesce(s.directory,''),
+        f"""select s.id, coalesce(s.title,'(无标题)'), coalesce(s.directory,''),
                   count(m.id), coalesce(sum(m.input_tokens),0), coalesce(sum(m.output_tokens),0),
                   coalesce(sum(m.computed_total_tokens),0), max(m.completed_at)
            from model_usage m left join session s on s.id = m.session_id
-           where m.status='completed'
+           where m.status='completed' and {where}
            group by m.session_id order by max(m.completed_at) desc limit ?""",
-        (limit,),
+        params,
     ).fetchall()
 
 
@@ -1362,15 +1370,15 @@ def _report_stats(con, covers=frozenset()):
         return ((m, p, v) for (bk, m, p), v in rng.items() if bk == i)
 
     sess = []
-    for r in recent_sessions(con, 20):
+    # v267：派生会话在 SQL 里先排除再取 10 条——先取 20 再过滤时子代理/工作流会话会把名额
+    # 占满，列表常只剩两三条主会话（真实库近 20 个活跃会话里 17 个是派生会话）。
+    for r in recent_sessions(con, 10, main_only=True):
         sid = str(r[0] or "")
         if _is_sub_session(sid):
             continue
         sess.append({"sid": sid, "title": r[1] or "", "directory": r[2] or "",
                      "requests": r[3] or 0,
                      "total": (r[4] or 0) + (r[5] or 0), "last_at": r[7] or 0})
-        if len(sess) >= 10:
-            break
 
     return {"models": {rid: _report_model_rows(_range_buckets(i))
                        for i, rid in enumerate(_REPORT_RANGES)},
@@ -2700,15 +2708,52 @@ _SERVE_CACHE_MAX_AGE = 30.0
 _SERVE_SAME = '{"same":1}'
 
 
-def _serve_change_token(con):
-    """v266：常驻快照快路径判据——只取会改变快照的写入。
+_SERVE_RECENT_ROWS = 64   # 工具状态探测窗口：status 的 UPDATE 多落在最近插入的行上（典型负载假设；
+                          # 越窗时由请求完成时的 model_usage 插入或 30s 缓存上限兜底）
+_SERVE_MARKS_TTL_MS = 300   # 会话探测自身要扫 session 表（~2–3ms），按连接短缓存后每请求可忽略
 
-    model_usage/turn_usage/tool_usage/session 的插入都发生在请求或工具完成时，
-    取 max(rowid) 均 O(1)（实测 <0.05ms）；不能取 count(*) 或 max(completed_at)
-    （52k 行全扫 ~50ms，探测成本会吃回收益）。config.json mtime 一并纳入，
-    改配置（lang/pricing 等）不必等缓存上限。任一查询失败（老库缺表/连接已坏）
-    返回 None，调用方退回全量路径。
-    """
+_serve_marks_cache = {"con": None, "ts": 0.0, "val": None}
+
+
+def _serve_session_marks(con):
+    """session 行增删改的探测值（v267）：标题生成/归档/软删除的时间戳列 + 行数。
+
+    不用 time_updated：宿主在生成中的每个 step 边界都会 bump 它（与 part 行同步），
+    纳进来会让常驻缓存失去意义（v266 已确认生成期间只有 part 变）。列缺失或查询失败
+    返回 None——只让这类变化退回 30s 缓存上限，不整体放弃缓存。结果按连接身份短缓存
+    （serve 复用同一连接时命中；测试/换库换连接时自动重探）。"""
+    now = time.time() * 1000
+    if _serve_marks_cache["con"] is con and now - _serve_marks_cache["ts"] < _SERVE_MARKS_TTL_MS:
+        return _serve_marks_cache["val"]
+    val = None
+    try:
+        have = {str(r[1]) for r in con.execute("pragma table_info(session)").fetchall()}
+    except sqlite3.Error:
+        have = None
+    if have is not None:
+        cols = [c for c in ("time_title_updated", "time_archived", "time_deleted") if c in have]
+        try:
+            row = con.execute("select count(*), " + (", ".join("max(" + c + ")" for c in cols)
+                              if cols else "0") + " from session").fetchone()
+            val = tuple(row)
+        except sqlite3.Error:
+            val = None
+    _serve_marks_cache["con"], _serve_marks_cache["ts"], _serve_marks_cache["val"] = con, now, val
+    return val
+
+
+def _serve_change_token(con):
+    """v266/v267：常驻快照快路径判据——只取会改变快照的写入。
+
+    分量顺序（服务端按索引判断哪些聚合缓存需要清）：
+      0 model_usage max(rowid)；1 turn_usage max(rowid)；2 tool_usage max(rowid)；
+      3 session max(rowid)；4 最近 _SERVE_RECENT_ROWS 条 tool_usage 的 (rowid,status)；
+      5 会话行探测值（见 _serve_session_marks）；6 config.json mtime_ns。
+    - 工具行开始时 INSERT running、完成时 UPDATE：只看 max(rowid) 会让「一轮里最后一个
+      工具完成」拖到缓存上限；顺带覆盖最近行的删除。
+    - 会话标题/归档/删除是 UPDATE/DELETE，取专用时间戳列与行数（不取 time_updated）。
+    - 后两项探测失败（老库缺列）只让该类变化退回 30s 上限兜底；四张表的 rowid 查询失败
+      （缺表/连接已坏）返回 None，调用方退回全量路径。"""
     vals = []
     for sql in ("select max(rowid) from model_usage",
                 "select max(rowid) from turn_usage",
@@ -2719,6 +2764,13 @@ def _serve_change_token(con):
         except sqlite3.Error:
             return None
         vals.append(row[0] if row else None)
+    try:
+        vals.append(tuple(con.execute(
+            "select rowid, status from tool_usage order by rowid desc limit ?",
+            (_SERVE_RECENT_ROWS,)).fetchall()))
+    except sqlite3.Error:
+        vals.append(None)
+    vals.append(_serve_session_marks(con))
     try:
         vals.append(os.stat(CONFIG_PATH).st_mtime_ns)
     except OSError:
@@ -2817,11 +2869,23 @@ def serve():
                     # 相关表没变：旧泵拿完整缓存包，新泵只拿 {"same":1} 跳过整包重推。
                     out = _SERVE_SAME if _query_same_ok(req) else cache_out
             if out is None:
+                if tok is not None and tok != cache_tok:
+                    # v267：聚合短缓存（today/report/项目/会话池，2–5s TTL）只看 model_usage /
+                    # turn_usage（报表费用还看 config）与会话行增删改；只有这些分量变化才清。
+                    # 工具状态变化不清——宿主每个工具起止都会改它，全清会把 v266 的收益吃掉。
+                    prev = cache_tok if isinstance(cache_tok, tuple) else ()
+                    core_now = (tok[0], tok[1], tok[5], tok[6])
+                    core_prev = (prev[0], prev[1], prev[5], prev[6]) if len(prev) >= 7 else None
+                    if core_now != core_prev:
+                        _AGG_CACHE.clear()
+                        _PROJ_CACHE.clear()
                 payload = snapshot(force_sid, routes, serve_con=con)
                 out = json.dumps(payload)
-                # 远端 scopes 请求永不缓存（远端数据可独立变化）；失败载荷不缓存。
+                # 远端 scopes 请求永不缓存（远端数据可独立变化）；失败或行级降级载荷不缓存
+                # （local_error 非空=瞬时读失败产出的零值行，回放会把降级态钉住 30s）。
                 if (con is not None and not routes and tok is not None
-                        and not (isinstance(payload, dict) and payload.get("error"))):
+                        and not (isinstance(payload, dict)
+                                 and (payload.get("error") or payload.get("local_error")))):
                     cache_req, cache_tok, cache_out, cache_at = req, tok, out, now
         except Exception as e:
             out = json.dumps({"error": str(e)[:200]})   # 单次查询失败不杀常驻进程

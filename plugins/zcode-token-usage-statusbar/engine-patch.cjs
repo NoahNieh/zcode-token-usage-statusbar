@@ -211,8 +211,19 @@ function createEnginePatcher(opts) {
     const built = buildPatchedSource(text, target);
     if (built.error) return set("error", built.error);
     try {
-      // 首次打补丁留一份未打补丁原字节备份（已有备份不叠加，避免堆文件）
-      const hasBackup = fs.readdirSync(path.dirname(enginePath)).some((f) => f.startsWith(BACKUP_PREFIX));
+      // 未打补丁原字节备份（v267：按 sha 判定本版本是否已有备份——客户端升级后旧版备份仍在，
+      // 只看「目录里有没有备份」会让新版本原版永远不留底；旧版备份不删，手工恢复以 sha 为准；
+      // 每次客户端升级约新增一份整引擎备份，需要时按 sha 判断哪份是当前版本）
+      let hasBackup = false;
+      try {
+        const engineDir = path.dirname(enginePath);
+        hasBackup = fs.readdirSync(engineDir)
+          .filter((f) => f.startsWith(BACKUP_PREFIX))
+          .some((f) => {
+            try { return sha256hex(fs.readFileSync(path.join(engineDir, f))) === sha; }
+            catch (e) { return false; }
+          });
+      } catch (e) { hasBackup = false; }
       if (!hasBackup) {
         let mode = 0o644;
         try { mode = fs.statSync(enginePath).mode & 0o777; } catch (e) { /* 已读成功，stat 失败极罕见 */ }

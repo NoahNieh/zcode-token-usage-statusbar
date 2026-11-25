@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""serve 快照缓存回归（v266 变更门控 + same_ok 协议）。
+"""serve 快照缓存回归（v266 变更门控 + same_ok 协议；v267 补 UPDATE/DELETE 探测、
+聚合短缓存清理与降级载荷不缓存）。
 
 覆盖：相关表未变时回放上一份快照、model_usage 插入失效、请求行变化失效、
 same_ok 只回 {"same":1}、远端 scopes 永不缓存、config mtime 失效、缓存上限、
@@ -23,6 +24,7 @@ _spec.loader.exec_module(zusage)
 # 与 test_serve_conn_reuse 同款最小库（缓存戳只依赖这几张表的 rowid）
 SCHEMA = """
 create table session (id text primary key, title text, parent_id text, time_created integer,
+  time_updated integer, time_title_updated integer,
   summary_additions integer, summary_deletions integer, summary_files integer);
 create table model_usage (id text primary key, session_id text, turn_id text, query_source text,
   agent text, provider_id text, model_id text, status text, started_at integer, first_token_at integer,
@@ -59,7 +61,8 @@ class ServeCacheTests(unittest.TestCase):
             self.conns.append(con)
             return con
 
-        for name, value in (("DB_PATH", self.db), ("CONFIG_PATH", self.cfg), ("_pricing", None)):
+        for name, value in (("DB_PATH", self.db), ("CONFIG_PATH", self.cfg), ("_pricing", None),
+                            ("_SERVE_MARKS_TTL_MS", 0)):
             patch = mock.patch.object(zusage, name, value)
             patch.start()
             self.addCleanup(patch.stop)
@@ -195,6 +198,75 @@ class ServeCacheTests(unittest.TestCase):
         self.assertNotIn("error", payloads[1])
         self.assertEqual(len(calls), 2)
 
+    def test_degraded_payload_not_cached(self):
+        """v267：带 local_error 的行级降级快照不缓存——回放会把瞬时读失败的零值行钉住。"""
+        def side(n):
+            return {"n": n, "local_error": "disk I/O error"} if n == 1 else {"n": n}
+
+        self.patch_snapshot(side)
+        payloads = self.run_serve(["\n", "\n", ""])
+        self.assertEqual([p["n"] for p in payloads], [1, 2])
+        self.assertEqual(payloads[0].get("local_error"), "disk I/O error")
+
+    def test_write_clears_aggregate_short_caches(self):
+        """v267：变更戳变化导致重算时，先清 today/report/项目聚合短缓存，避免旧聚合被新戳钉住。"""
+        flags = []
+
+        def side(n):
+            if n == 1:
+                # 模拟首个快照填好的聚合短缓存，随后宿主落库
+                zusage._AGG_CACHE[("today", 1)] = (0, (1,))
+                zusage._PROJ_CACHE[("db", 1)] = (0, {})
+                self.add_usage_row("r2")
+            else:
+                flags.append((("today", 1) in zusage._AGG_CACHE, ("db", 1) in zusage._PROJ_CACHE))
+            return {"n": n}
+
+        self.patch_snapshot(side)
+        payloads = self.run_serve(["\n", "\n", ""])
+        self.assertEqual([p["n"] for p in payloads], [1, 2])
+        self.assertEqual(flags, [(False, False)], "重算前必须清空聚合短缓存")
+
+    def test_tool_status_change_keeps_aggregate_caches(self):
+        """v267：聚合短缓存不依赖 tool_usage——工具起止只失效快照，不清 today/report/项目缓存。"""
+        writer = sqlite3.connect(self.db)
+        try:
+            writer.execute("insert into tool_usage (session_id, tool_name, status, duration_ms) values ('s1','x','running',0)")
+            writer.commit()
+        finally:
+            writer.close()
+        flags = []
+
+        def side(n):
+            if n == 1:
+                zusage._AGG_CACHE[("today", 1)] = (0, (1,))
+                zusage._PROJ_CACHE[("db", 1)] = (0, {})
+                w = sqlite3.connect(self.db)
+                try:
+                    w.execute("update tool_usage set status='completed' where tool_name='x'")
+                    w.commit()
+                finally:
+                    w.close()
+            else:
+                flags.append((("today", 1) in zusage._AGG_CACHE, ("db", 1) in zusage._PROJ_CACHE))
+            return {"n": n}
+
+        self.patch_snapshot(side)
+        payloads = self.run_serve(["\n", "\n", ""])
+        self.assertEqual([p["n"] for p in payloads], [1, 2], "工具状态变化仍须失效快照")
+        self.assertEqual(flags, [(True, True)], "但不得清聚合短缓存")
+
+    def test_hit_keeps_aggregate_short_caches(self):
+        """未变更时命中快路径，不清聚合短缓存（清空只该发生在有写入的重算前）。"""
+        def side(n):
+            zusage._AGG_CACHE[("today", 1)] = (0, (1,))
+            return {"n": n}
+
+        self.patch_snapshot(side)
+        payloads = self.run_serve(["\n", "\n", ""])
+        self.assertEqual([p["n"] for p in payloads], [1, 1])
+        self.assertIn(("today", 1), zusage._AGG_CACHE)
+
     # ---- 变更戳本身 ----
 
     def test_change_token_tracks_rowids(self):
@@ -208,6 +280,63 @@ class ServeCacheTests(unittest.TestCase):
             con.close()
         self.assertIsNotNone(before)
         self.assertNotEqual(before, after)
+
+    def test_change_token_tracks_tool_status_update_and_session_delete(self):
+        """v267：同 rowid 的 status UPDATE 与 session 行 DELETE 都要改变变更戳。"""
+        con = sqlite3.connect(self.db)
+        try:
+            con.execute("insert into tool_usage (session_id, tool_name, status, duration_ms) values ('s1','x','running',0)")
+            con.commit()
+            t1 = zusage._serve_change_token(con)
+            con.execute("update tool_usage set status='completed' where tool_name='x'")
+            con.commit()
+            t2 = zusage._serve_change_token(con)
+            con.execute("delete from session where id='s1'")
+            con.commit()
+            t3 = zusage._serve_change_token(con)
+        finally:
+            con.close()
+        self.assertNotEqual(t1, t2, "工具完成是 UPDATE，max(rowid) 不变")
+        self.assertNotEqual(t2, t3, "会话删除会改变行数")
+
+    def test_tool_status_update_invalidates_serve_cache(self):
+        writer = sqlite3.connect(self.db)
+        try:
+            writer.execute("insert into tool_usage (session_id, tool_name, status, duration_ms) values ('s1','x','running',0)")
+            writer.commit()
+        finally:
+            writer.close()
+
+        def side(n):
+            if n == 1:
+                w = sqlite3.connect(self.db)
+                try:
+                    w.execute("update tool_usage set status='completed' where tool_name='x'")
+                    w.commit()
+                finally:
+                    w.close()
+            return {"n": n}
+
+        self.patch_snapshot(side)
+        payloads = self.run_serve(["\n", "\n", ""])
+        self.assertEqual([p["n"] for p in payloads], [1, 2])
+
+    def test_session_change_invalidates_serve_cache(self):
+        # 宿主生成标题时 UPDATE title 并 bump time_title_updated（time_updated 在生成中每个 step
+        # 都会变，v267 刻意不纳入变更戳，故这里只按标题专用列构造）
+        def side(n):
+            w = sqlite3.connect(self.db)
+            try:
+                if n == 1:
+                    w.execute("update session set title='renamed', time_title_updated=42 where id='s1'")
+                w.commit()
+            finally:
+                w.close()
+            return {"n": n}
+
+        self.patch_snapshot(side)
+        payloads = self.run_serve(["\n", "\n", ""])
+        self.assertEqual([p["n"] for p in payloads], [1, 2])
 
     def test_change_token_missing_table_is_none(self):
         con = sqlite3.connect(":memory:")

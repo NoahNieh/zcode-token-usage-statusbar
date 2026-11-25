@@ -29,6 +29,26 @@ PANE_ANCHORS = {
 }
 
 
+def testid_stubs():
+    """SessionPane 夹具里 testid 辅助函数与其参数常量的桩声明，从各版本锚点推导。
+
+    登记新版本只动 PANE_ANCHORS 即可；此前手写常量漏了 3.18.2/3.19.1/4.0.0 的 aC/FC/gC，
+    有 node 的机器上该用例恒红，而缺 node 的机器整条跳过、无人察觉。"""
+    fns, args = [], []
+    for anchor in PANE_ANCHORS.values():
+        m = re.search(rb'"data-testid":(\w+)\((\w+),e\)', anchor)
+        if m:
+            fn, arg = m.group(1).decode(), m.group(2).decode()
+            if fn not in fns:
+                fns.append(fn)
+            if arg not in args:
+                args.append(arg)
+    if not fns or not args:
+        raise AssertionError("PANE_ANCHORS 未匹配到 testid 辅助名：夹具推导失效，先核对锚点形状")
+    return ('const vb=()=>"pane", ' + ', '.join(f + '=vb' for f in fns if f != 'vb') +
+            ', ' + ', '.join(a + '=null' for a in args) + ';\n')
+
+
 def mini_for(target):
     names = target['names']
     pane = target['pane']
@@ -293,7 +313,7 @@ assert.equal(next['data-zusage-pane-id'],'pane-2');
                     patched = bridge.transform_module(module, 'patch')
                 text = patched.decode().replace('export function', 'function')
                 text = text.replace('export{ ' + target['names']['registry'] + ' };', '')
-                fixture = 'const vb=()=>"pane", Oa=vb, hb=vb, Sb=vb, Gb=vb, Fx=vb, VRe=null, Mr=null, WRe=null, aBe=null, hVe=null;\n' + text + assertions
+                fixture = testid_stubs() + text + assertions
                 script = self.root / f'{target["version"]}-props.cjs'
                 script.write_text('const vm=require("node:vm");vm.runInNewContext(' +
                                   json.dumps(fixture) + ',{assert:require("node:assert/strict")});')

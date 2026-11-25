@@ -700,6 +700,11 @@ class QuietMonitorTests(unittest.TestCase):
         kernel32 = ctypes.windll.kernel32
         kernel32.OpenProcess.restype = ctypes.c_void_p
         handle = kernel32.OpenProcess(0x00100001, False, pid)   # SYNCHRONIZE | PROCESS_TERMINATE
+        if not handle and kernel32.GetLastError() == 87:        # ERROR_INVALID_PARAMETER：PID 已不存在
+            # 监控在 _spawn_via_wmi 等待 PowerShell 退出期间就已退完（无待收尾包即立即返回），
+            # 句柄拿不到是正常竞态而非失败；此路径查不到退出码，导入链与静默开关由本文件
+            # 其余 mock 用例覆盖。
+            return
         self.assertTrue(handle, "WMI 返回的 PID 不可等待")
         try:
             kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
@@ -709,6 +714,15 @@ class QuietMonitorTests(unittest.TestCase):
                 self.fail("监控未在 30s 内干净退出")
         finally:
             kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+    def test_quiet_monitor_module_runs_directly_and_exits_zero(self):
+        # 直跑（非 WMI）覆盖导入链与 --quiet 的干净退出：WMI 用例在监控先于句柄获取就退出时
+        # 只能证明「PID 已不存在」，无法区分正常退出与导入失败，这里补退出码证据。
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "install_monitor.py"), "0", str(self.asar),
+             str(self.runtime), "--quiet"],
+            capture_output=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace")[:400])
 
     def test_oserror_retry_stops_at_one_day_deadline(self):
         self.pending()
