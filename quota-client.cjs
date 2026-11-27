@@ -41,6 +41,28 @@ const EXP_RETRY_MS = 5 * 60 * 1000;
 const RESET_PATH = "/api/v1/coding-plan/reset/status";
 const RESET_TTL_MS = 5 * 60 * 1000;       // 对齐宿主 STATUS_POLL_INTERVAL_MS
 const RESET_PARSE_BACKOFF_MS = 15 * 60 * 1000;
+/* v269 周额度预测：BigModel 周窗（unit 6）的已用 % 采样序列 → 按「周期起点至今的日均」外推。
+ * 样本只在 settleOk（过代际守卫的 ok 结算）追加；窗口身份=resetsAt（换周期即换序列）；
+ * 序列落盘 historyPath（注入侧传入运行目录，未传=仅内存），热换/重启后回读继续。曲线首选
+ * monitor 按时间范围接口的逐日用量（见 USAGE_HISTORY_*），接口不可用时退回采样序列；两者都是
+ * 额度链自身数据，不借本地 token 统计（两条链互不推导）。 */
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const FORECAST_MAX_PTS = 96;                 // 每序列采样上限；超限隔点抽稀（两端恒留，旧样本等比变稀）
+const FORECAST_MIN_BASE_MS = 60 * 60 * 1000; // 周期头 1 小时内按 1 小时摊平算日均（防 t→0 速率发散）
+const FORECAST_DROP_PTS = 1.5;               // 同周期内已用 % 回落超过该值=换账号/换套餐，旧序列作废
+const HISTORY_VERSION = 1;
+const HISTORY_MAX_SERIES = 16;
+/* v269 续：用量曲线的真数据——BigModel monitor 的按时间范围用量接口（与 quota/limit 同域同凭据，
+ * 仍是额度链自身数据，不借本地 token 统计）：
+ *   GET {origin}/api/monitor/usage/model-usage?startTime=YYYY-MM-DD HH:mm:ss&endTime=…（墙钟时间）
+ * 返回 data.x_time[]（小时桶标签）+ tokensUsage[]；桶值是整小时总量、不按范围裁剪（两端沾边即整桶），
+ * 长范围自动降为日粒度，范围内完全无数据时两数组为空。额度接口只给整数百分比、不给 token 上限，
+ * 所以曲线按「当前已用 %」等比标定（见 historyDaysToPts）。 */
+const USAGE_HISTORY_PATH = "/api/monitor/usage/model-usage";
+const USAGE_HISTORY_MIN_INTERVAL_MS = 5 * 60 * 1000;   // 每源每周期至多 5 分钟拉一次（额度 TTL 为 10 分钟）
+const USAGE_HISTORY_MAX_TZ_OFFSET_MS = 14 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
 
 /* ---------- 基础工具 ---------- */
 function sha16(v) { return crypto.createHash("sha256").update(String(v)).digest("hex").slice(0, 16); }
@@ -712,6 +734,13 @@ for (const fam of ["bigmodel", "zai"]) {
         envKeys: [], envUrl: "", subPath: null };
   ADAPTERS.push({
     id: fam, label: fam === "bigmodel" ? "BigModel" : "Z.ai", kind: "plan", defaultOn: false, envKeys: conf.envKeys,
+    forecast: fam === "bigmodel",   // v269：周窗采样与预测，仅 BigModel（Z.ai 同接口但未启用）
+    /* v269：周窗曲线的逐日用量来源——monitor 按时间范围接口，与额度 URL 同源（env 覆盖同样生效）；
+     * 解析不了返回 null=不拉。鉴权头与额度请求同款。 */
+    usageHistoryUrl(j) {
+      try { return new URL((conf.envUrl && j.env[conf.envUrl]) || conf.origin + QUOTA_PATH).origin + USAGE_HISTORY_PATH; } catch (e) { return null; }
+    },
+    usageHistoryBearer: conf.bearer,
     detect(j, providerId) {
       if (providerId.indexOf("account:") !== 0) return null;
       if (isTeamProviderId(providerId)) return { team: true };
@@ -1568,6 +1597,127 @@ const SOURCE_PRESETS = {
   volcano: { keyUrl: "https://console.volcengine.com/ark" },
 };
 
+/* ---------- v269 周额度预测（纯函数；调度器在 settleOk 后调用） ---------- */
+function thinPts(pts, max) {   // 超限隔点抽稀：首尾恒留、其余保留奇数下标，重复到不超限
+  while (pts.length > max && pts.length > 2) {
+    const out = [pts[0]];
+    for (let i = 1; i < pts.length - 1; i += 2) out.push(pts[i]);
+    out.push(pts[pts.length - 1]);
+    pts = out;
+  }
+  return pts;
+}
+/* 追加一个采样并返回新序列（不改入参）：
+ * - resetsAt 变化=进入新周期，序列重开；
+ * - 同一时刻的样本覆盖（时钟未推进的重复结算）；
+ * - 时钟回拨，或同周期内已用 % 回落超 FORECAST_DROP_PTS（换账号/换套餐），序列重开；
+ * - 周期内已用 % 单调不减，采样长间隙是缺口不是零用量——直线连接即可，不补点。 */
+function appendSample(prev, t, pct, reset) {
+  let pts = prev && prev.reset === reset && Array.isArray(prev.pts) ? prev.pts.slice() : [];
+  const last = pts.length ? pts[pts.length - 1] : null;
+  if (last && t < last[0]) pts = [];                            // 时钟回拨
+  else if (last && pct < last[1] - FORECAST_DROP_PTS) pts = []; // 换账号/换套餐
+  else if (last && t === last[0]) pts.length -= 1;              // 同刻重复结算：移除旧样本，下面重新追加（等价覆盖）
+  pts.push([t, pct]);
+  return { reset, pts: thinPts(pts, FORECAST_MAX_PTS) };
+}
+/* 周窗预测：周期起点=resetsAt−7 天；日均=已用 % ÷（起点至今时长，不足 1 小时按 1 小时）；
+ * hit=按该日均外推到 100% 的时刻（ms；晚于重置=本周期内不会用尽，记 null）；end=重置时刻的
+ * 外推已用 %。已达 100%：hit=首个 ≥100% 的采样时刻、end=当前值（不再外推）。pts 以「周期起点
+ * 起的整分钟偏移」输出（快照每次推送全量序列，紧凑数组控体积）。无法预测（无重置时刻/不在
+ * 周期内）返回 null。 */
+function forecastWeekly(s, t) {
+  const pts = s && Array.isArray(s.pts) ? s.pts : null;
+  const pct = pts && pts.length ? pts[pts.length - 1][1] : null;
+  const reset = s ? s.reset : null;
+  if (typeof reset !== "number" || !isFinite(reset) || typeof t !== "number" || !isFinite(t) ||
+      typeof pct !== "number" || !isFinite(pct)) return null;
+  const start = reset - WEEK_MS, elapsed = t - start;
+  if (!(elapsed > 0) || t >= reset) return null;
+  const avg = pct / Math.max(elapsed, FORECAST_MIN_BASE_MS) * DAY_MS;
+  let hit = null, end = pct;
+  if (pct >= 100) {
+    hit = t;
+    for (const p of pts) if (p[1] >= 100) { hit = p[0]; break; }
+  } else {   // 未达上限：日均为 0 时 (100−pct)/0 = Infinity，晚于重置，自然判为不会用尽
+    const h = t + (100 - pct) / avg * DAY_MS;
+    if (h < reset) hit = h;
+    end = pct + avg * (reset - t) / DAY_MS;
+  }
+  return {
+    start, reset, pct, at: t,
+    avg: Math.round(avg * 1000) / 1000,   // %/天
+    hit, end: Math.round(end * 10) / 10,
+    pts: pts.map((p) => [Math.round((p[0] - start) / 60000), p[1]]),
+  };
+}
+/* 把 model-usage 响应归一成「本地日 → 周期内 token 数」：days = [[日起点 ms, 日终点 ms, tokens], …]。
+ * 桶标签是服务端墙钟：首桶必为含查询起点的那一桶，用它与查询起点所在桶起点的差推时区偏移，
+ * 把桶换算到本机时区后再按本地日聚合（日界线与折线横轴、本地统计口径一致）。首桶跨周期起点时
+ * 按时间比例折算（桶值不裁剪，不折会把上周最后一小时的用量算进本周）；只留有用量、且与首桶
+ * 同粒度的桶。形状不符（缺数组/长度不等/首标签解析不了/首桶不含查询起点/success:false）返回 null。 */
+function parseUsageHistory(body, start, end) {
+  const d = body && typeof body === "object" && body.success !== false && body.data && typeof body.data === "object" ? body.data : null;
+  const labels = d && Array.isArray(d.x_time) ? d.x_time : null;
+  const usage = d && Array.isArray(d.tokensUsage) ? d.tokensUsage : null;
+  if (!labels || !labels.length || !usage || usage.length !== labels.length) return null;
+  const parseLabel = (label) => {
+    const m = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2}))?/.exec(String(label == null ? "" : label));
+    if (!m) return null;
+    const day = m[4] === undefined;
+    const ms = new Date(+m[1], +m[2] - 1, +m[3], day ? 0 : +m[4], day ? 0 : +m[5]).getTime();
+    return isFinite(ms) ? { ms, day } : null;
+  };
+  const first = parseLabel(labels[0]);
+  if (!first) return null;
+  const bucketMs = first.day ? DAY_MS : HOUR_MS;
+  const sd = new Date(start);
+  const base = first.day ? new Date(sd.getFullYear(), sd.getMonth(), sd.getDate()).getTime() : Math.floor(start / bucketMs) * bucketMs;
+  let offset = Math.round((first.ms - base) / 900000) * 900000;
+  if (!(Math.abs(offset) <= USAGE_HISTORY_MAX_TZ_OFFSET_MS)) offset = 0;
+  const b0 = first.ms - offset;
+  if (!(b0 <= start && start < b0 + bucketMs)) return null;
+  const days = new Map();
+  for (let i = 0; i < labels.length; i++) {
+    const p = parseLabel(labels[i]);
+    if (!p || p.day !== first.day) continue;
+    const bStart = p.ms - offset;
+    if (bStart + bucketMs <= start || bStart > end) continue;   // 整桶在周期起点之前，或在查询终点之后
+    const tok = Number(usage[i]);
+    if (!(tok > 0) || !isFinite(tok)) continue;
+    const ds = new Date(bStart);
+    const dayStart = new Date(ds.getFullYear(), ds.getMonth(), ds.getDate()).getTime();
+    const add = tok * (bStart < start ? Math.min(1, (bStart + bucketMs - start) / bucketMs) : 1);
+    const row = days.get(dayStart);
+    if (row) row[2] += add;
+    else days.set(dayStart, [dayStart, new Date(ds.getFullYear(), ds.getMonth(), ds.getDate() + 1).getTime(), add]);
+  }
+  return Array.from(days.values()).sort((a, b) => a[0] - b[0]);
+}
+/* 逐日 token → 逐日累计已用 %（等比标定到最新采样的 pct）：自周期起点所在日起逐个本地日累加，顶点落在
+ * 每个已完结日的本地零点（没有桶的日按 0 用量，折线在无用量日走平）；未完结的当日不落顶点，由调用方
+ * 在末尾接 (最新采样时刻, 当前值)。无用量或当前 0% 返回 null（交给采样序列）。 */
+function historyDaysToPts(days, start, t, pct) {
+  let total = 0;
+  for (const d of days) total += d[2];
+  if (!(total > 0) || !(pct > 0)) return null;
+  const byDay = new Map(days.map((d) => [d[0], d[2]]));
+  const sd = new Date(start);
+  let cur = new Date(sd.getFullYear(), sd.getMonth(), sd.getDate()), cum = 0;
+  const out = [];
+  while (cur.getTime() < t) {
+    cum += byDay.get(cur.getTime()) || 0;
+    const next = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate() + 1).getTime();
+    if (next < t) out.push([next, Math.round(cum / total * pct * 10) / 10]);   // 当日未完结：不落顶点
+    cur = new Date(next);
+  }
+  return out;
+}
+function fmtLocalTime(ms) {   // monitor 时间范围参数：本机时区墙钟 "YYYY-MM-DD HH:mm:ss"
+  const d = new Date(ms), p = (n) => (n < 10 ? "0" : "") + n;
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
 /* ---------- 多源调度器 ---------- */
 function createQuotaClient(opts) {
   const o = opts || {};
@@ -1605,6 +1755,91 @@ function createQuotaClient(opts) {
     return secrets;
   }
   const extras = {};   // 快照侧注入的账本数据（scnet 估算等）：noteSnapshotExtras 写入
+
+  /* v269 周额度预测采样（FORECAST_* 见文件头）：源 id → 周窗序列 {reset, pts:[[t,已用%],…]}。
+   * historyPath 由注入侧显式传入（运行目录 quota-history.json）；未传=仅内存——测试的虚拟
+   * secretsPath 绝不派生出落盘路径。文件只存归一化后的时间与已用 %（无凭据/订阅字段）；
+   * 缺失/损坏按空起步，读写失败静默（不拖累额度主链）；保存时顺手清掉已过期周期。 */
+  const historyPath = typeof o.historyPath === "string" && o.historyPath ? o.historyPath : "";
+  const series = new Map();
+  let disposed = false;
+  if (historyPath) {
+    try {
+      const d = JSON.parse(fs.readFileSync(historyPath, "utf8"));
+      const rows = d && d.v === HISTORY_VERSION && d.series && typeof d.series === "object" ? d.series : {};
+      for (const id of Object.keys(rows)) {
+        const s = rows[id];
+        if (series.size >= HISTORY_MAX_SERIES || !s || typeof s.reset !== "number" || !(s.reset > now())) continue;
+        const pts = Array.isArray(s.pts) ? s.pts.filter((p) => Array.isArray(p) && p.length === 2 &&
+          Number.isFinite(p[0]) && Number.isFinite(p[1]) && p[0] >= 0 && p[0] < s.reset && p[1] >= 0 && p[1] <= 100) : [];
+        if (!pts.length) continue;   // 单点序列同样有效：新周期首个采样也要活过热换/重启
+        pts.sort((a, b) => a[0] - b[0]);
+        series.set(String(id), { reset: s.reset, pts: thinPts(pts, FORECAST_MAX_PTS) });
+      }
+    } catch (e) { /* 缺失/损坏按空起步 */ }
+  }
+  function saveHistory() {
+    if (!historyPath) return;
+    const t = now(), out = {};
+    for (const [id, s] of series) {
+      if (!(s.reset > t)) { series.delete(id); continue; }   // 周期已过：不再保留
+      out[id] = s;
+    }
+    const tmp = historyPath + ".tmp";
+    try {
+      fs.writeFileSync(tmp, JSON.stringify({ v: HISTORY_VERSION, series: out }));
+      fs.renameSync(tmp, historyPath);
+    } catch (e) {
+      try { fs.unlinkSync(tmp); } catch (e2) { /* 临时文件清理失败无碍 */ }
+    }
+  }
+  /* 只对声明 forecast 的适配器（BigModel）记周窗样本；预测与值同批落到 st 上，entryView 按
+   * 「预测的 resetsAt == 当前值的周窗 resetsAt」放行——值被撤销/换周期时自然不暴露。 */
+  function noteForecast(st, value, t) {
+    const a = adapterOf(st.id);
+    const win = value && value.windows && value.windows.weekly;
+    if (!a || !a.forecast || !win || typeof win.percent !== "number" || !isFinite(win.percent) ||
+        typeof win.resetsAt !== "number" || !isFinite(win.resetsAt)) return;
+    const next = appendSample(series.get(st.id), t, win.percent, win.resetsAt);
+    series.set(st.id, next);
+    st.forecast = effectiveForecast(st);
+    saveHistory();
+    loadUsageHistory(st, win.resetsAt, t);
+  }
+  /* 实际下发的曲线：有本周期的接口逐日用量 → 逐日累计点 + (最新采样, 当前值)；否则用采样序列。
+   * 已达上限时仍用采样序列——用尽时刻取首个 ≥100% 的采样，日粒度会晚到次日零点。 */
+  function effectiveForecast(st) {
+    const s = series.get(st.id), hist = st.hist;
+    if (!s || !s.pts.length) return null;
+    const last = s.pts[s.pts.length - 1];
+    const daily = last[1] < 100 && hist && hist.reset === s.reset ? historyDaysToPts(hist.days, s.reset - WEEK_MS, last[0], last[1]) : null;
+    return forecastWeekly(daily ? { reset: s.reset, pts: daily.concat([last]) } : s, last[0]);
+  }
+  /* 拉 monitor 的按时间范围用量（可选增强：任何失败静默，曲线退回采样序列，不进退避/代际状态机）。
+   * 每源每周期按 USAGE_HISTORY_MIN_INTERVAL_MS 节流；在途请求被新请求/卸载中止。代际守卫：响应
+   * 到达时实例已 dispose、源凭据指纹已变或已被更新的请求取代则丢弃。 */
+  function loadUsageHistory(st, reset, t) {
+    const a = adapterOf(st.id);
+    const base = a && typeof a.usageHistoryUrl === "function" ? a.usageHistoryUrl(j) : null;
+    if (!base || !(st.cred && typeof st.cred.token === "string" && st.cred.token)) return;
+    if (st.histReset === reset && st.histAt && t - st.histAt < USAGE_HISTORY_MIN_INTERVAL_MS) return;
+    if (st.histKill) { clearTimeout(st.histKill); st.histKill = null; }
+    if (st.histCtl) { try { st.histCtl.abort(); } catch (e) { } }
+    const ctl = new AbortController(), fp = st.fingerprint, start = reset - WEEK_MS;
+    st.histCtl = ctl; st.histAt = t; st.histReset = reset;
+    const url = base + "?startTime=" + encodeURIComponent(fmtLocalTime(start)) + "&endTime=" + encodeURIComponent(fmtLocalTime(t));
+    const done = () => { if (st.histKill) { clearTimeout(st.histKill); st.histKill = null; } };
+    st.histKill = setTimeout(() => { try { ctl.abort(); } catch (e) { } }, FETCH_TIMEOUT_MS);
+    http.maybeGetJson(url, { authorization: (a.usageHistoryBearer ? "Bearer " : "") + st.cred.token }, ctl).then((body) => {
+      done();
+      if (disposed || st.fingerprint !== fp || st.histCtl !== ctl) return;
+      const days = parseUsageHistory(body, start, t);
+      if (!days) return;
+      st.hist = { reset, days };
+      st.forecast = effectiveForecast(st);
+      if (onUpdate) onUpdate();
+    }, done);
+  }
 
   /* HTTP 助手：分类错误（401/403 auth_failed、429 rate_limited、5xx/其它 network_error、
    * JSON 解析 parse_error）；maybeGetJson 任何失败返回 null（探测/可选端点用）。 */
@@ -1724,7 +1959,8 @@ function createQuotaClient(opts) {
     let st = states.get(id);
     if (!st) {
       st = { id, status: "idle", reason: "", value: null, fetchedAt: 0, nextAt: 0, backoffIdx: 0,
-        fingerprint: "", epoch: 0, inFlight: null, ctl: null, lastError: "", ctx: null };
+        fingerprint: "", epoch: 0, inFlight: null, ctl: null, lastError: "", ctx: null,
+        hist: null, histAt: 0, histReset: null, histCtl: null, histKill: null };   // v269：接口逐日用量（本周期的 days）与在途拉取
       states.set(id, st);
     }
     return st;
@@ -1782,6 +2018,7 @@ function createQuotaClient(opts) {
     st.backoffIdx = 0;
     const a = adapterOf(st.id);
     st.nextAt = now() + (a && a.kind === "balance" ? TTL_BALANCE_MS : TTL_MS);
+    if (!disposed) noteForecast(st, value, st.fetchedAt);   // v269：dispose 后的迟到结算不再记样本（防热换后旧实例回写文件）
     if (onUpdate) onUpdate();
   }
 
@@ -1965,6 +2202,9 @@ function createQuotaClient(opts) {
       st.reason = "";
       st.lastError = "";
       st.fingerprint = "";
+      st.hist = null;       // v269：归属切换=换账号上下文，旧账号的逐日用量与节流戳一并作废
+      st.histAt = 0;
+      st.histReset = null;
       st.backoffIdx = 0;
       st.nextAt = 0;
     }
@@ -1992,6 +2232,8 @@ function createQuotaClient(opts) {
       if (st.value.kind) v.kind = st.value.kind;
       if (st.value.subscription) v.subscription = st.value.subscription;
       if (st.value.quotaSummary) v.quotaSummary = st.value.quotaSummary;
+      const wk = st.value.windows && st.value.windows.weekly;   // v269：预测与当前周窗同一周期才暴露
+      if (st.forecast && wk && st.forecast.reset === wk.resetsAt) v.forecast = st.forecast;
     }
     return v;
   }
@@ -2219,8 +2461,9 @@ function createQuotaClient(opts) {
         fetchedAt: prim.fetchedAt, stale: prim.stale, error: prim.error,
         level: prim.level, plan: prim.plan, balance: prim.balance,
         windows: prim.windows, tools: prim.tools, models: prim.models, ledger: prim.ledger,
-        label: prim.label, kind: prim.kind, subscription: prim.subscription, quotaSummary: prim.quotaSummary,
-      });
+      label: prim.label, kind: prim.kind, subscription: prim.subscription, quotaSummary: prim.quotaSummary,
+      forecast: prim.forecast,
+    });
       if (resetGateOpen()) {   // v135：重置卡独立字段（关开关不暴露旧值，fail-closed）
         const t = now(), resets = {};
         for (const famConf of RESET_FAMILIES) {
@@ -2277,8 +2520,11 @@ function createQuotaClient(opts) {
     },
     secretsPath,
     dispose() {
+      disposed = true;   // v269：此后迟到结算不再记周窗样本
       for (const st of states.values()) {
         if (st.ctl) { try { st.ctl.abort(); } catch (e) { } }
+        if (st.histCtl) { try { st.histCtl.abort(); } catch (e) { } }   // v269：在途的逐日用量拉取一并中止并清定时器
+        if (st.histKill) { clearTimeout(st.histKill); st.histKill = null; }
         st.inFlight = null;
       }
       for (const st of resetStates.values()) {
@@ -2290,6 +2536,7 @@ function createQuotaClient(opts) {
     get _state() { return states.get(primaryId) || states.get("custom") || {}; },   // 测试接缝兼容（v96 单源形状）
     _states: states,
     _adapters: ADAPTERS,
+    _series: series,   // v269 测试接缝：周窗采样序列
   };
 }
 
@@ -2323,4 +2570,9 @@ module.exports = {
   },
   TTL_MS,
   RESET_TTL_MS,
+  forecastWeekly,      // v269 周额度预测纯函数（单测 + settleOk 调用）
+  appendSample,
+  parseUsageHistory,   // v269 monitor 逐日用量归一（纯函数）
+  historyDaysToPts,    // v269 逐日 token → 等比标定的累计已用 % 点
+  FORECAST_MAX_PTS,
 };

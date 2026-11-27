@@ -6,7 +6,7 @@ See model speed, token usage, context size, plan quota, and Git status while you
 
 ## What you get
 
-- Floating status bar (desktop): generation speed (tok/s), per-turn / session / today token usage, cache hit rate, sub-agent breakdown, context usage, plan-quota chip, Git status chip. Tooltips show details; the ⚙ panel toggles what is shown.
+- Floating status bar (desktop): generation speed (tok/s), per-turn / session / today token usage, cache hit rate, sub-agent breakdown, context usage, plan-quota chip, Git status chip. Tooltips show details; the ⚙ panel toggles what is shown. Hovering the BigModel plan-quota chip also shows a weekly usage forecast card (predicted time to the limit and the usage curve).
 - Per-answer rate line appended under each reply: tok/s, time to first token, output tokens, duration, session totals.
 - `/usage` command (today / week / models / current), the `token_usage` MCP tool, and a skill that teaches the agent how to query usage.
 
@@ -29,7 +29,7 @@ Auto-install is always on (the legacy `plugin_auto_install_overlay` config key a
 |---|---|
 | Hooks | `SessionStart` syncs runtime files, checks for updates, and auto-installs when not injected; `PromptSubmit` records the prompt timestamp and appends the per-answer rate line. |
 | MCP server | `.mcp.json` starts `usage_mcp.py` as a stdio JSON-RPC server exposing `token_usage(scope)`. It reads the local usage database only. |
-| Files written | `~/.zcode/zcode-token-usage-statusbar/` (runtime files, config, per-session state; secrets file is `0600`); a patch + backup inside the ZCode client directory (`app.asar`); overlay settings in `~/.zcode/zusage3`. Uninstalling the plugin does not delete personal config. |
+| Files written | `~/.zcode/zcode-token-usage-statusbar/` (runtime files, config, per-session state; secrets file is `0600`; `quota-history.json` holds the BigModel weekly-quota forecast samples — timestamps and used percentages only, no credentials); a patch + backup inside the ZCode client directory (`app.asar`); overlay settings in `~/.zcode/zusage3`. Uninstalling the plugin does not delete personal config. |
 | Network | Local statistics never leave your machine (read-only SQLite). The plan-quota chip is on by default (turn it off in ⚙): it decrypts the host's stored OAuth credentials **in memory only** and calls BigModel / Z.ai usage endpoints directly to show your plan quota; credentials are never written to config, logs, or diagnostics. Plugin updates download code from the configured source. Optional SSH/WSL remote queries go through the connection channel you configured; the plugin never decrypts or reuses host passwords or key passphrases and never auto-deploys. The Git chip runs local read-only `git` queries (no fetch, no network). |
 | Executed commands | Python scripts shipped with the plugin; `git` (read-only status queries); `ssh`/`wsl.exe` only for remote usage you configured. |
 | Third-party code | None bundled — plain Python 3.8 stdlib, plain JavaScript (Electron main-process CommonJS). MIT licensed; source at [ByteRax/zcode-token-usage-statusbar](https://github.com/ByteRax/zcode-token-usage-statusbar). |

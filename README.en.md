@@ -84,6 +84,7 @@ To go fully offline, in `~/.zcode/zcode-token-usage-statusbar/config.json`:
 
 - SSH passwords and private-key passphrases stored in ZCode are **never decrypted or reused**; remote queries only use channels you explicitly configure.
 - Quota credentials are used in memory only and never logged; credentials manually saved in ⚙ go to `quota-secrets.json` in the runtime directory (0600).
+- The BigModel weekly-quota forecast draws its usage curve from BigModel's time-range usage query (hourly usage of the current week, folded into days; same domain and credentials as the quota query). When that endpoint is unavailable it falls back to local samples: "time + used %" of each quota query recorded in `quota-history.json` in the runtime directory (no credentials). Delete that file any time and it starts over from the next query.
 - The Anthropic source requires explicit opt-in and may then read `~/.claude/.credentials.json`.
 
 ## Data semantics (short version)

@@ -59,3 +59,15 @@
 - 额度与本地 token 统计是两条链，互不推导。额度只进桌面快照链；MCP、CLI、`/usage` stdout 契约不加字段；Web 端不做（sidecar 无凭据）。
 - 回归：`tests/quota-*.test.cjs`（client 解密/归一化/状态机/竞态/各家适配器形状、paths、provider-revoke、source-lifecycle）、`tests/overlay-quota-chip.test.cjs`（挂载/门控/还原/多源协议/源列表 UI）、`tests/test_statusbar_rate.py`（provider_fallback / scnet 估算）。用例数随改动变化，不在文档里写死；真实厂商响应、凭据刷新解冻与 chip 实机挂载需桌面验收，unverified 适配器待真实账号校准。
 - `quota-client.cjs` 自热换循环合入起由 loader 热换：部署后一个热 tick 内生效并自动销账 marker（旧 loader 仍需完全重启）；热换重建实例会重跑 `resolveHostQuotaPaths` 与 provider 绑定。生效证据是 sync 链 marker 被自动销账或额度链行为恢复，overlay 热重载验证不覆盖它。
+
+## 8. BigModel 周窗用量预测（v269）
+
+- **只对声明 `forecast` 的适配器生效**（BigModel 家族，含 apiKey 复合源 `bigmodel:<providerId>`；Z.ai 同接口但未启用）。数据只用额度链自身数据，不读本地 token 统计（§7 两条链互不推导）：预测锚点=每次 `settleOk`（过代际守卫的 ok 结算）把 `(now, windows.weekly.percent)` 追加到该源的周窗序列。
+- **曲线来源（首选）= monitor 按时间范围用量**：ok 结算后向 `{origin}/api/monitor/usage/model-usage?startTime=…&endTime=…`（本机墙钟 `YYYY-MM-DD HH:mm:ss`，范围=周期起点至今）拉小时桶 `x_time[]`/`tokensUsage[]`——与额度请求同域同凭据、同款 `authorization` 头，额度 URL 的 env 覆盖同样决定它的 origin（解析不了=不拉）。`parseUsageHistory` 归一成本地日 token，`historyDaysToPts` 以最新采样的已用 % **等比标定**成「各完结日零点的累计 %」（额度接口只给整数百分比、不给 token 上限；无桶的日按 0 用量落顶点，未完结的当日不落，末点恒为最新采样）。实测陷阱：桶值是整小时总量、**不按范围裁剪**（两端沾边即整桶；首桶跨周期起点时按时间比例折算，否则会把上周最后一小时算进本周）；桶标签是服务端墙钟，用首桶（必为含查询起点的那一桶）与查询起点的差推时区偏移再按本机日聚合，首桶不含起点即整体拒收；长范围自动降为日粒度，与首桶不同粒度的桶丢弃；`totalUsage`/`modelSummaryList` 的口径与序列不一致，**只用序列数组**；范围内完全无数据时数组为空。每源每周期 5 分钟节流；失败/形状不符/迟到（dispose、凭据指纹变化、被更新的请求取代）一律静默，曲线退回采样序列，不进退避/代际状态机；已用 ≥100% 时也用采样序列（用尽时刻取首个 ≥100% 的采样，日粒度会晚到次日零点）。
+- **序列身份 = `resetsAt`**：换周期即换序列；同刻样本覆盖；时钟回拨、或同周期内已用 % 回落超过 1.5 点（换账号/换套餐）序列重开。周期内已用 % 单调不减；采样序列是接口逐日用量不可用时的回退，其间隙（ZCode 未运行）是缺口不是零用量，渲染端直线连接——接口逐日用量是账号级数据，没有这个缺口。`resetsAt` 非数值（缺失/ISO 串）不预测。
+- **落盘**：`historyPath` 由 `inject-main.cjs` 显式传入（运行目录 `quota-history.json`，与 `quota-secrets.json` 同目录）；未传=仅内存——**不得从 `secretsPath`/`credsPath` 派生**（测试用虚拟路径，会落到盘根）。文件只有 `{v, series: {源 id: {reset, pts: [[t, 已用%], …]}}}`，无凭据/订阅字段；损坏按空起步、读写失败静默（不拖累额度主链）；加载与保存时清掉已过期周期；每序列上限 `FORECAST_MAX_PTS`，超限隔点抽稀（首尾恒留）；单点序列照样回读（新周期首个采样要活过热换）。dispose 后的迟到结算不再记样本（防热换后旧实例回写文件）。
+- **预测口径**（`forecastWeekly`，纯函数）：周期起点 = `resetsAt` − 7 天；日均 = 已用 % ÷（起点至今时长，不足 1 小时按 1 小时摊平，防周期头速率发散）；`hit` = 按该日均到 100% 的时刻（晚于重置记 null = 本周期内不会用尽）；`end` = 重置时刻的外推已用 %；已达 100% 时 `hit` = 首个 ≥100% 的采样时刻、`end` = 当前值。`pts` 以周期起点起的整分钟偏移下发（快照每次推送全量携带，控体积）。
+- **下发**：`entryView` 仅在「`st.forecast.reset` == 当前值周窗的 `resetsAt`」时带 `forecast`（值被撤销/换周期/重置时刻消失时自然不暴露），`view()` 顶层镜像同步带；`sourcesConfig()` 与 MCP/CLI/`/usage` 契约不含。
+- **展示**：额度 tooltip 本周窗口行下方的预测卡（`quotaForecastCardHTML`，规则见 [overlay-ui.md](overlay-ui.md) §4）；stale / 非 ok / 周期已过期 / 形状不合法整块隐藏。
+- 回归：`tests/quota-forecast.test.cjs`（纯函数、集成、落盘、dispose 迟到结算；逐日用量的解析/时区偏移/折算/标定/节流/回退/迟到丢弃——用例以本地零点构造周期，期望值不依赖测试机时区）、`tests/overlay-quota-chip.test.cjs` 预测卡用例（含逐日顶点折线几何）、`tests/quota-paths.test.cjs` 的 `historyPath` 接线断言。
+- **已知限制**：同源换账号无法从额度接口辨识（订阅 id 按规则丢弃），只有已用回落时才重开序列——换到用量更高的账号会把两段曲线接在一起；日均是「周期至今平均」，周初样本少时预测会随用量明显摆动；曲线按 token 占比等比分摊到当前已用 %，额度若按别的口径计量（模型加权等）形状会有偏差，但末端恒等于当前已用 %；`model-usage` 是无文档逆向接口，形状变化按契约整体拒收退回采样序列。

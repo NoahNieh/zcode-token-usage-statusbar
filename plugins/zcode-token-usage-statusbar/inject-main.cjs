@@ -923,6 +923,7 @@ function createQuotaClientInstance() {
     quotaClient = createQuotaClient({
       ...quotaPaths,
       secretsPath: QUOTA_SECRETS,
+      historyPath: path.join(HERE, "quota-history.json"),   // v269：周窗采样序列（时间 + 已用 %，无凭据）；未传则 quota-client 仅内存
       quotaEnabled,
       resetEnabled: resetBadgeEnabled,
       resetList: true,   // v135：bigmodel 族并行查网页控制台列表端点（近 7 天过期卡 + 上次重置）

@@ -6,7 +6,7 @@
 
 ## 你能得到什么
 
-- 桌面悬浮状态条：生成速度（tok/s）、本轮 / 会话 / 今日 token 用量、缓存命中率、子代理明细、上下文容量、套餐额度 chip、Git 状态 chip。悬停看明细，⚙ 面板可调整显示项。
+- 桌面悬浮状态条：生成速度（tok/s）、本轮 / 会话 / 今日 token 用量、缓存命中率、子代理明细、上下文容量、套餐额度 chip、Git 状态 chip。悬停看明细，⚙ 面板可调整显示项；BigModel 套餐悬停另有本周用量预测卡（预计用尽时刻与用量曲线）。
 - 每条回答末尾自动追加逐问速率行：tok/s、首字延迟、输出 token、生成耗时、会话累计。
 - `/usage` 命令（today / week / models / current）、`token_usage` MCP 工具，以及一个教会智能体查询用量的技能。
 
@@ -29,7 +29,7 @@
 |---|---|
 | Hook | `SessionStart` 同步运行文件、检查更新、未注入时自动安装；`PromptSubmit` 记录提问时间戳并追加逐问速率行。 |
 | MCP 服务 | `.mcp.json` 以 stdio JSON-RPC 启动 `usage_mcp.py`，提供 `token_usage(scope)` 工具，只读本地用量数据库。 |
-| 文件写入 | `~/.zcode/zcode-token-usage-statusbar/`（运行文件、配置、会话状态；凭据文件权限 `0600`）；ZCode 客户端目录内的补丁与备份（`app.asar`）；`~/.zcode/zusage3` 中的浮层设置。卸载插件不删除个人配置。 |
+| 文件写入 | `~/.zcode/zcode-token-usage-statusbar/`（运行文件、配置、会话状态；凭据文件权限 `0600`；`quota-history.json` 记录 BigModel 周额度预测的采样——时间与已用百分比，不含凭据）；ZCode 客户端目录内的补丁与备份（`app.asar`）；`~/.zcode/zusage3` 中的浮层设置。卸载插件不删除个人配置。 |
 | 网络 | 本地统计绝不出本机（只读 SQLite）。套餐额度 chip 默认开启（⚙ 面板可关）：在**内存中**解密宿主持有的 OAuth 凭据，直连 BigModel / Z.ai 用量端点展示套餐额度；凭据绝不写入配置、日志或诊断。插件更新会从已配置来源下载代码。可选的 SSH/WSL 远端查询走你自行配置的连接通道；插件不解密复用宿主密码或私钥口令，也不自动部署。Git chip 只在本机只读执行 `git` 查询（不 fetch、不联网）。 |
 | 执行的命令 | 随插件分发的 Python 脚本；`git`（只读状态查询）；仅对你配置过的远端查询使用 `ssh`/`wsl.exe`。 |
 | 第三方代码 | 不捆绑任何第三方代码——纯 Python 3.8 标准库 + 原生 JavaScript（Electron 主进程 CommonJS）。MIT 许可证；源码在 [ByteRax/zcode-token-usage-statusbar](https://github.com/ByteRax/zcode-token-usage-statusbar)。 |

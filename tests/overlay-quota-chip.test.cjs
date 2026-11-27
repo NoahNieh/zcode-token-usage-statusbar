@@ -145,7 +145,7 @@ function harness({ quotaOn = true, prefs = {} } = {}) {
   function mutate(pane) {
     for (const o of [...observers]) if (o.connected && o.target === pane) o.fn([]);
   }
-  return { window, body, inject, tick, boot, buildComposer, payload, chipOf, liveOf, tipEl, mutate, observers, lsStore };
+  return { window, body, root, inject, tick, boot, buildComposer, payload, chipOf, liveOf, tipEl, mutate, observers, lsStore };
 }
 
 const NOW = Date.now();
@@ -1183,4 +1183,213 @@ test('v251 quota remaining toggle: panel checkbox persists the pref and re-rende
    * 面板 checkbox 不入 stub 查询树），以源码双落点计数锁存在性——删任一处回填此断言即红 */
   assert.equal((source.match(/qrBox\.checked = !!state\.quotaRemain/g) || []).length, 2,
     'both buildPanel and syncPanel restore the checkbox state');
+});
+
+/* ---------- v269 BigModel 周额度用量预测卡 ---------- */
+/* forecast 夹具以真实当前时刻为基准（卡片有 Date.now() < reset 的周期门，at 必须落在周期内）：
+ * 缺省=「会用尽」形态（已过 2 天用 60%、剩 5 天：日均 30 → 1.33 天后用尽、周期末外推 210%）；
+ * safe=「不会用尽」（已过 4 天用 60%、剩 3 天：日均 15、周期末 105%）。 */
+const F_AT = Date.now() - 5000, DAY_MS = 86400e3;
+function forecastFixture(kind, over) {
+  const base = kind === 'safe'
+    ? { start: F_AT - 4 * DAY_MS, reset: F_AT + 3 * DAY_MS, pct: 60, at: F_AT, avg: 15, hit: null, end: 105,
+      pts: [[0, 0], [2880, 20], [5759, 58], [5760, 60]] }
+    : { start: F_AT - 2 * DAY_MS, reset: F_AT + 5 * DAY_MS, pct: 60, at: F_AT, avg: 30, hit: F_AT + 40 / 30 * DAY_MS, end: 210,
+      pts: [[0, 0], [1440, 20], [2880, 60]] };
+  return Object.assign(base, over || {});
+}
+const withForecast = (f, extra) => Object.assign({}, QUOTA_OK, {
+  windows: Object.assign({}, QUOTA_OK.windows, { weekly: { percent: f.pct, resetsAt: f.reset, details: [] } }), forecast: f }, extra || {});
+function showTip(h, quota, ui) {
+  h.window.__zusageUpdate(h.payload({ quota }));
+  const chip = h.chipOf(ui.wrap);
+  chip.listeners.get('mouseenter')[0].call(chip);
+  return h.tipEl();
+}
+function booted(prefs) {
+  const h = harness(prefs ? { prefs } : {}), ui = h.buildComposer('workspace-main', 'sid_main');
+  h.inject(); h.boot(); h.tick();
+  return { h, ui };
+}
+
+test('forecast card: renders right below the weekly row with title, reset + predicted hit, chart geometry, average and legend (v269)', () => {
+  const { h, ui } = booted();
+  const tip = showTip(h, withForecast(forecastFixture()), ui);
+  assert.equal(tip.style.display, 'block');
+  const html = tip.innerHTML;
+  assert.match(html, /本周窗口<\/b><span>已用 60% · 重置 \d{4}-\d\d-\d\d \d\d:\d\d<\/span><\/div><style>/);   // 紧跟窗口行之后
+  assert.match(html, /<div class="qt-fc" role="img" aria-label="本周已用 60%，重置 [\d-]+ [\d:]+，本周平均 30%\/天，预计 [\d-]+ [\d:]+ 用尽">/);
+  assert.match(html, /<div class="qt-fc-t">本周已用 <b class="qt-fc-n">60%<\/b><\/div>/);
+  assert.match(html, /<div class="qt-fc-s">重置 \d{4}-\d\d-\d\d \d\d:\d\d · <span class="qt-fc-warn">预计 \d{4}-\d\d-\d\d \d\d:\d\d 用尽<\/span><\/div>/);
+  assert.match(html, /<span>本周平均 30%\/天<\/span>/);
+  assert.match(html, /<span class="qt-fc-lg"><i class="qt-fc-sw qt-fc-mid"><\/i>已用<i class="qt-fc-sw qt-fc-sw-fc"><\/i>预测<i class="qt-fc-sw qt-fc-sw-lim"><\/i>周上限<\/span>/);
+  /* 几何：viewBox 440×132，绘图区 x∈[34,426]、y∈[16,108]；外推 210% → 纵轴封顶 200%（50% 一档） */
+  assert.match(html, /<svg class="qt-fc-svg qt-fc-mid" viewBox="0 0 440 132" width="440" height="132" aria-hidden="true">/);
+  assert.match(html, /<path d="M34,108L90,98.8L146,80.4L146,108Z" fill="currentColor" fill-opacity="\.1"\/>/);      // 面积：折线回到基线围合
+  assert.match(html, /<path class="qt-fc-line" d="M34,108L90,98.8L146,80\.4"\/>/);                                      // 已用折线：周期起点 0% → 采样点 → 最新采样（重合顶点合并）
+  assert.match(html, /<path class="qt-fc-fc" d="M146,80\.4L407\.33,16"\/>/);                                            // 预测虚线画到触及 200% 顶边
+  assert.match(html, /<circle class="qt-fc-end" cx="407\.33" cy="16" r="3\.2"\/>/);
+  assert.match(html, /<text class="qt-fc-fct" x="407\.33" y="9" text-anchor="end">210%<\/text>/);                       // 标签仍标真实外推值
+  assert.match(html, /<circle class="qt-fc-hitc" cx="220\.67" cy="62" r="3\.2"\/>/);                                    // 穿过 100% 上限的位置
+  assert.match(html, /<circle cx="146" cy="80\.4" r="4" fill="currentColor"\/><circle class="qt-fc-dotc" cx="146" cy="80\.4" r="1\.8"\/>/);
+  assert.match(html, /<line class="qt-fc-lim" x1="34" y1="62" x2="426" y2="62"\/>/);
+  for (const t of ['0%', '50%', '100%', '150%', '200%']) assert.match(html, new RegExp(' text-anchor="end" dy="0\\.35em">' + t + '</text>'), t);
+  assert.doesNotMatch(html, />250%</, 'axis is capped at 200%');
+  assert.match(html, /<text class="qt-fc-hitt" x="220\.67" y="124" text-anchor="middle">\d\d-\d\d \d\d:\d\d<\/text>/);   // 用尽时刻标在横轴
+  assert.match(html, /<text x="34" y="124" text-anchor="start">\d\d-\d\d \d\d:\d\d<\/text>/);                            // 周期起点恒显、末尾默认显示重置时刻（相距足够远时用尽标签居中同排）
+  assert.match(html, /<text x="426" y="124" text-anchor="end">\d\d-\d\d \d\d:\d\d<\/text>/);
+  assert.ok((html.match(/<text x="[\d.]+" y="124" text-anchor="middle">\d\d-\d\d<\/text>/g) || []).length >= 1, 'midnight date ticks fill the gaps');
+  assert.doesNotMatch(html, /\n/, 'no raw newlines: .tip is white-space:pre-line');
+  h.chipOf(ui.wrap).listeners.get('mouseleave')[0].call(h.chipOf(ui.wrap));
+  assert.equal(tip.style.display, 'none');
+});
+
+test('forecast card: "will not run out" caps the axis at 100%, draws no hit marker, and the line color follows the usage band', () => {
+  const { h, ui } = booted();
+  const html = showTip(h, withForecast(forecastFixture('safe')), ui).innerHTML;
+  assert.match(html, / · 按当前节奏本周不会用尽<\/div>/);
+  assert.match(html, /<span>本周平均 15%\/天<\/span>/);
+  assert.match(html, /<path class="qt-fc-line" d="M34,108L146,95\.73L258,71\.2"\/>/);            // 末分钟内的采样（5759/5760）并入 (at, pct) 收口点，不画重合线头
+  assert.match(html, /<path class="qt-fc-fc" d="M258,71\.2L426,43\.6"\/>/);            // 预测画到周期末 105%
+  assert.match(html, /<text class="qt-fc-fct" x="426" y="36\.6" text-anchor="end">105%<\/text>/);
+  assert.match(html, />150%</);
+  assert.doesNotMatch(html, /<circle class="qt-fc-hitc"|<text class="qt-fc-hitt"|>200%</);   // 类名本身出现在内嵌样式里，按元素断言
+  const svgOf = (over) => showTip(h, withForecast(forecastFixture('safe', over)), ui).innerHTML;
+  const bandOf = (pct) => (svgOf({ pct, pts: [[0, 0], [5760, pct]] }).match(/<svg class="qt-fc-svg qt-fc-(\w+)"/) || [])[1];
+  assert.equal(bandOf(0), 'calm');
+  assert.equal(bandOf(49.9), 'calm');
+  assert.equal(bandOf(50), 'mid');
+  assert.equal(bandOf(89.9), 'mid');
+  assert.equal(bandOf(90), 'crit');
+  assert.equal(bandOf(99.9), 'crit');
+  assert.equal(bandOf(100), 'exc');                                                  // 与 chip 分段同一套阈值（50/90/100）
+  assert.match(svgOf({ pct: 95, pts: [[0, 0], [5760, 95]] }), /<i class="qt-fc-sw qt-fc-crit"><\/i>已用/);   // 图例色块同档
+  assert.match(svgOf({ pct: 20, pts: [[0, 0], [5760, 20]] }), /<svg class="qt-fc-svg qt-fc-calm" viewBox/);
+});
+
+test('forecast card: a reached limit is a flat line with no extrapolation; no usage yet gives no verdict', () => {
+  const { h, ui } = booted();
+  /* end 给不一致的 140（主进程不会给，防御旧/异常载荷）：已达上限一律走平线、标签取归一化后的 100% */
+  const reached = showTip(h, withForecast(forecastFixture('safe', { pct: 100, avg: 25, hit: F_AT - DAY_MS, end: 140, pts: [[2880, 58], [4032, 100]] })), ui).innerHTML;
+  assert.match(reached, /<svg class="qt-fc-svg qt-fc-exc" viewBox/);
+  assert.match(reached, / · <span class="qt-fc-warn">已达本周上限<\/span><\/div>/);
+  assert.match(reached, /<path class="qt-fc-line" d="M34,108L146,54\.64L190\.8,16L258,16"\/>/);
+  assert.match(reached, /<path class="qt-fc-fc" d="M258,16L426,16"\/>/);
+  assert.match(reached, /text-anchor="end">100%<\/text>/);
+  assert.doesNotMatch(reached, /<circle class="qt-fc-hitc"|预计 |不会用尽|>140%|>150%</);
+  const idle = showTip(h, withForecast(forecastFixture('safe', { pct: 0, avg: 0, hit: null, end: 0, pts: [[2880, 0]] })), ui).innerHTML;
+  assert.match(idle, / · 本周暂无用量<\/div>/);
+  assert.match(idle, /<svg class="qt-fc-svg qt-fc-calm" viewBox/);
+  assert.match(idle, /<path class="qt-fc-line" d="M34,108L146,108L258,108"\/>/);
+  assert.match(idle, /<path class="qt-fc-fc" d="M258,108L426,108"\/>/);
+  assert.doesNotMatch(idle, /预计 |不会用尽|已达本周上限/);
+});
+
+test('forecast card is fail-closed: missing field, stale, not ok, expired window, malformed shapes', () => {
+  const { h, ui } = booted();
+  const whole = [QUOTA_OK,   // 旧主进程：无 forecast 字段
+    Object.assign(withForecast(forecastFixture()), { stale: true }),
+    Object.assign(withForecast(forecastFixture()), { status: 'network_error' })];
+  for (const quota of whole) {
+    const html = showTip(h, quota, ui).innerHTML;
+    assert.doesNotMatch(html, /qt-fc/);
+    assert.match(html, /本周窗口<\/b><span>/, 'the rest of the tooltip still renders');
+  }
+  const overrides = [
+    { reset: F_AT - 1000, start: F_AT - 1000 - 7 * DAY_MS, at: F_AT - 3600e3, hit: null, pts: [[60, 60]] },   // 周期已过期，等待刷新
+    { pct: NaN }, { pct: -1 }, { pts: null }, { pts: 'x' }, { start: 'x' }, { avg: null },
+    { end: undefined }, { at: F_AT + 10 * DAY_MS }, { reset: F_AT }, { reset: null }, { at: F_AT - 30 * DAY_MS },
+  ];
+  for (const over of overrides) {
+    const html = showTip(h, withForecast(forecastFixture('safe', over)), ui).innerHTML;
+    assert.doesNotMatch(html, /qt-fc/, JSON.stringify(over));
+  }
+  /* 非法/越界采样点被跳过而不是渲染出 NaN；全部跳过时折线退化为 起点→最新采样 两点 */
+  const sparse = showTip(h, withForecast(forecastFixture('safe', { pts: [[NaN, 5], [10, 'x'], [-5, 3]] })), ui).innerHTML;
+  assert.match(sparse, /<path class="qt-fc-line" d="M34,108L258,71\.2"\/>/);
+  assert.doesNotMatch(sparse, /NaN|undefined/);
+});
+
+test('forecast card speaks English under zusage3.lang=en and stays in used-% terms under the remaining-quota display mode', () => {
+  const en = booted({ 'zusage3.lang': 'en' });
+  const html = showTip(en.h, withForecast(forecastFixture()), en.ui).innerHTML;
+  assert.match(html, /This week<\/b><span>used 60%/);
+  assert.match(html, /<div class="qt-fc-t"><b class="qt-fc-n">60%<\/b> of weekly quota used<\/div>/);
+  assert.match(html, /<div class="qt-fc-s">Resets \d{4}-\d\d-\d\d \d\d:\d\d · <span class="qt-fc-warn">On pace to hit the limit \d{4}-\d\d-\d\d \d\d:\d\d<\/span><\/div>/);
+  assert.match(html, /<span>Averaging 30% a day<\/span>/);
+  assert.match(html, /<i class="qt-fc-sw qt-fc-sw-fc"><\/i>Forecast<i class="qt-fc-sw qt-fc-sw-lim"><\/i>Weekly limit</);
+  const zh = booted({ 'zusage3.quotaRemain': '1' });
+  const html2 = showTip(zh.h, withForecast(forecastFixture()), zh.ui).innerHTML;
+  assert.match(html2, /本周窗口<\/b><span>剩余 40% · 重置 /);                       // 窗口行随 ⚙「显示剩余额度」反转
+  assert.match(html2, /<div class="qt-fc-t">本周已用 <b class="qt-fc-n">60%<\/b><\/div>/);   // 卡片恒已用口径（标题写明）
+});
+
+test('forecast card HTML is a pure function of the forecast data: hover-time reconciles never rewrite the tooltip', () => {
+  const { h, ui } = booted();
+  const tip = showTip(h, withForecast(forecastFixture()), ui);
+  assert.ok(tip.__zuTipSig.includes('qt-fc'));
+  tip.innerHTML = 'SENTINEL';
+  h.tick();                                   // 500ms 扫描 + 600ms heavy 对账：悬停中会重跑 showQuotaTip
+  h.tick();
+  assert.equal(tip.innerHTML, 'SENTINEL', 'same data → same content signature → innerHTML untouched');
+  assert.equal(tip.style.display, 'block');
+  h.window.__zusageUpdate(h.payload({ quota: withForecast(forecastFixture('safe', { pct: 61, pts: [[0, 0], [5759, 60], [5760, 61]] })) }));
+  assert.match(tip.innerHTML, /<div class="qt-fc-t">本周已用 <b class="qt-fc-n">61%<\/b><\/div>/, 'new data → rebuilt in place');
+});
+
+test('forecast card reads the top-level mirror on the old flat quota protocol; the quota tooltip follows the theme via zu-light', () => {
+  const light = booted();
+  const tip = showTip(light.h, Object.assign({}, QUOTA_OK, { forecast: forecastFixture() }), light.ui);   // 旧主进程平铺协议（无 sources）
+  assert.match(tip.innerHTML, /<div class="qt-fc-t">本周已用 /);
+  assert.equal(tip.classList.contains('zu-light'), true, 'no .dark on <html> → light');
+  const dark = booted();
+  dark.h.root.classList.add('dark');
+  assert.equal(showTip(dark.h, withForecast(forecastFixture()), dark.ui).classList.contains('zu-light'), false);
+});
+
+test('forecast card: the predicted-hit axis label takes the end label slot when they would collide; out-of-range hits keep the end label; the marker stays', () => {
+  const { h, ui } = booted();
+  const atX = (cx) => F_AT - 4 * DAY_MS + (cx - 34) / 392 * 7 * DAY_MS;   // safe 夹具（7 天周期）下横坐标 cx 对应的用尽时刻
+  const hitLabel = (html) => (html.match(/<text class="qt-fc-hitt" x="([\d.]+)" y="124" text-anchor="middle">\d\d-\d\d \d\d:\d\d<\/text>/) || [])[1];
+  const endLabel = /<text x="426" y="124" text-anchor="end">\d\d-\d\d \d\d:\d\d<\/text>/;
+  /* 撞位：用尽时刻标签压到周期末标签区间 → 末标签让位（副标题已带重置时刻），起点标签保留 */
+  const clash = showTip(h, withForecast(forecastFixture('safe', { hit: atX(381.2) })), ui).innerHTML;
+  assert.match(clash, /<circle class="qt-fc-hitc" cx="381\.2" cy="46\.67" r="3\.2"\/>/);
+  assert.equal(hitLabel(clash), '381.2');
+  assert.doesNotMatch(clash, endLabel);
+  assert.match(clash, /<text x="34" y="124" text-anchor="start">\d\d-\d\d \d\d:\d\d<\/text>/);
+  /* 阈值方向：标签区间 [x-35, x+35] 与末标签区间 [356, 426] 严格相交才让位 */
+  const near = showTip(h, withForecast(forecastFixture('safe', { hit: atX(322) })), ui).innerHTML;
+  assert.equal(hitLabel(near), '322');
+  assert.doesNotMatch(near, endLabel);
+  const adjacent = showTip(h, withForecast(forecastFixture('safe', { hit: atX(320) })), ui).innerHTML;
+  assert.equal(hitLabel(adjacent), '320');
+  assert.match(adjacent, endLabel);
+  /* 越出横轴右界（用尽时刻贴着周期末）：不写用尽标签，末标签照常；副标题仍给出精确时刻 */
+  const edge = showTip(h, withForecast(forecastFixture('safe', { hit: F_AT + 40 / 15 * DAY_MS })), ui).innerHTML;
+  assert.match(edge, /<circle class="qt-fc-hitc" cx="407\.33" cy="46\.67" r="3\.2"\/>/);
+  assert.equal(hitLabel(edge), undefined);
+  assert.match(edge, endLabel);
+  assert.match(edge, / · <span class="qt-fc-warn">预计 /);
+  /* 用尽时刻落在周期之外（主进程不会给，防御旧/异常载荷）：不画标记、不写预计，按「不会用尽」呈现 */
+  const beyond = showTip(h, withForecast(forecastFixture('safe', { hit: F_AT + 3 * DAY_MS + 1 })), ui).innerHTML;
+  assert.doesNotMatch(beyond, /<circle class="qt-fc-hitc"|<text class="qt-fc-hitt"|预计 /);
+  assert.match(beyond, / · 按当前节奏本周不会用尽<\/div>/);
+});
+
+test('forecast card: day-by-day vertices (vendor usage history) draw as a polyline that stays flat on no-usage days', () => {
+  const { h, ui } = booted();
+  const start = F_AT - 4 * DAY_MS - 6 * 3600e3;                     // 周期起点；at = 第 5 天 06:00（4.25 天）
+  const html = showTip(h, withForecast(forecastFixture('safe', {
+    start, reset: start + 7 * DAY_MS, pct: 30, at: F_AT, avg: 30 / 4.25, hit: null, end: 49.4,
+    pts: [[1440, 3], [2880, 9], [4320, 9], [5760, 18]],              // 各完结日零点的累计 %：11-25 无用量 → 两点同高
+  })), ui).innerHTML;
+  assert.match(html, /<div class="qt-fc-t">本周已用 <b class="qt-fc-n">30%<\/b><\/div>/);
+  assert.match(html, /<span>本周平均 7\.1%\/天<\/span>/);
+  /* 一天 56px：34 → 90 → 146 → 202 → 258；yMax=100，1% = 0.92px */
+  assert.match(html, /<path class="qt-fc-line" d="M34,108L90,105\.24L146,99\.72L202,99\.72L258,91\.44L272,80\.4"\/>/);
+  assert.match(html, /<path d="M34,108L90,105\.24L146,99\.72L202,99\.72L258,91\.44L272,80\.4L272,108Z" fill="currentColor" fill-opacity="\.1"\/>/);
+  assert.match(html, /<path class="qt-fc-fc" d="M272,80\.4L426,62\.55"\/>/);
+  assert.match(html, /<text class="qt-fc-fct" x="426" y="55\.55" text-anchor="end">49\.4%<\/text>/);
+  assert.doesNotMatch(html, /<circle class="qt-fc-hitc"/);
 });

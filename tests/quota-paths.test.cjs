@@ -271,6 +271,7 @@ test("main bridge: initialized paths and directory watchers use shared resolutio
   assert.equal(clients[0].credsPath, paths.credsPath);
   assert.equal(clients[0].customCfgPath, paths.customCfgPath);
   assert.equal(clients[0].secretsPath, "/fixture-runtime/quota-secrets.json");
+  assert.equal(clients[0].historyPath, "/fixture-runtime/quota-history.json");   // v269：周窗采样序列与 secrets 同在运行目录（未传则仅内存）
 });
 
 /* ---------- issue #205：主进程 env 没有 ZCODE_*（宿主只注入 CLI 子进程），数据目录
