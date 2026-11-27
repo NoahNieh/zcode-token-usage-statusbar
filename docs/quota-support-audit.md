@@ -16,7 +16,7 @@
 
 | 对象 | 实装与缺失 | 自动凭据取得 / 额外权限 | 实测程度与解析、展示边界 |
 |---|---|---|---|
-| BigModel 个人 Coding 套餐 | monitor 额度 + 订阅元数据；**周窗用量预测（v269）**：每次成功查询记一个 `(时间, 已用%)` 采样，按周期起点至今的日均外推用尽时刻；曲线取自 monitor 的按时间范围用量接口（`model-usage` 小时桶按本地日汇总、以当前已用 % 等比标定），接口不可用时退回采样序列，序列存运行目录 `quota-history.json`（无凭据） | 可解密宿主 OAuth；**apiKey 模式连接**（provider `bigmodel-api[-N]`）读 `provider_config.json` 同家族 key（编码套餐 key 优先，baseUrl 须在 bigmodel.cn 域）；支持专用 env 覆盖，不需额外索取管理 key | **本机实测**；账号级套餐池；团队套餐仍不支持；周窗预测是按日均的外推估算，逐日曲线与预测点均本机实测（曲线=接口小时用量按日汇总的等比标定，Z.ai 家族未启用） |
+| BigModel 个人 Coding 套餐 | monitor 额度 + 订阅元数据；**周窗用量预测（v269）**：每次成功查询记一个 `(时间, 已用%)` 采样，按周期起点至今的日均外推用尽时刻；曲线取自 monitor 的按时间范围用量接口（`model-usage` 小时桶按本地日汇总、以拉取时刻采样的已用 % 等比标定；v270 起只在打开额度悬停卡时按需拉取，每源每周期 5 分钟节流），接口不可用时退回采样序列，序列存运行目录 `quota-history.json`（无凭据） | 可解密宿主 OAuth；**apiKey 模式连接**（provider `bigmodel-api[-N]`）读 `provider_config.json` 同家族 key（编码套餐 key 优先，baseUrl 须在 bigmodel.cn 域）；支持专用 env 覆盖，不需额外索取管理 key | **本机实测**；账号级套餐池；团队套餐仍不支持；周窗预测是按日均的外推估算，逐日曲线与预测点均本机实测（曲线=接口小时用量按日汇总的等比标定，Z.ai 家族未启用） |
 | Z.ai Coding | 已有 Coding monitor 适配 | 宿主 Z.ai OAuth，或 apiKey 模式（`zai-api[-N]`）provider_config 同家族 key（baseUrl 须在 z.ai 域）；与 BigModel 凭据族区分 | 源码/夹具证据，不是真账号验收 |
 | ZCode Start Plan（bigmodel/zai 免费档，如 1024 Dev Day 的 one_time 发放池） | **本轮新增（2026-10-24）**：`zcode.z.ai /api/v1/zcode-plan/billing/balance` 专用适配（`plans[]`/`balances[]` 归一，按 `meter=model_usage` 桶聚合为「套餐」分段——不按 period 过滤，到期语义） | 解密宿主凭据 `zcodejwttoken`（`enc:v1`；OAuth access_token 实测 401 不可用）；请求必须带 `X-Device-Mid`（读 credentials.json 同目录 telemetry-state.json / onboarding-record.json，缺失 fail-closed 不发请求）；可选 secrets 覆盖 | bigmodel 家族 Start Plan 已本机真实账号实测（HTTP 200 全链含源状态与视图，2026-10-24）；zai 家族 start-plan 同链未实测；monitor 与 subscription 端点**不含** Start Plan 数据，同账号编码套餐与 Start Plan 两池并存分源展示 |
 | 重置卡徽标（bigmodel/zai 编码套餐，v135） | **本轮新增（2026-10-28）**：`zcode.z.ai/api/v1/coding-plan/reset/status` **只读**端点独立轮询（实测定案：ZCode API 基址，与宿主 OAuth token 端点同源；bigmodel.cn / api.z.ai 同路径实测 404 NOT_FOUND）；bigmodel 族另并行查网页控制台列表端点 `bigmodel.cn/api/biz/customer-package-reset/list?targetType=PERSONAL`（宿主 OAuth 裸 authorization，实测 200；补近 7 天过期卡与上次重置时间，status 无过期历史；失败静默降级）（5 分钟 TTL，独立退避/凭据指纹冻结；绝不调用 `/opportunity` 领取端点），`available_five_hour_resets`/`available_week_resets` 白名单解析、过期卡过滤，随快照顶层 `resets` 注入；UI 挂工具行内额度组左侧 `.zu-ctxrst` | 解密宿主 OAuth access_token（裸 `X-Bigmodel-Authorization`）+ `zcodejwttoken`（Bearer），缺一 fail-closed 不发请求；`Bigmodel-Target-Type: PERSONAL` 写死，团队套餐不支持；**apiKey-only 用户无重置卡**（reset 端点是宿主登录态契约）；独立开关 `reset_badge_enabled`（缺省开），额度 chip 关闭时仍查询本端点 | 源码转写自宿主 3.16.3 客户端实现（响应形状未真账号实测，unverified）；zai 族端点同链未实测 |
@@ -52,10 +52,10 @@
 
 ## 核对入口
 
-- `quota-client.cjs`：适配器、凭据发现、`resolvePrimary()`、`activeSet()`、`tickSource()` 与源列表；周窗预测的 `forecastWeekly` 与逐日用量的 `parseUsageHistory`/`historyDaysToPts`。
+- `quota-client.cjs`：适配器、凭据发现、`resolvePrimary()`、`activeSet()`、`tickSource()` 与源列表；周窗预测的 `forecastWeekly` 与逐日用量的 `parseUsageHistory`/`historyDaysToPts`/按需拉取 `refreshUsageHistory`。
 - `overlay.js`：源开关、凭据字段、chip/tooltip 的状态与归属展示。
 - `inject-main.cjs`：额度快照、配置写入与刷新桥接；`zusage.py`：SCNet 本地估算输入。
-- `tests/quota-client.test.cjs`、`tests/quota-forecast.test.cjs`、`tests/overlay-quota-chip.test.cjs`：隔离夹具；不是实际厂商账号凭据测试。
+- `tests/quota-client.test.cjs`、`tests/quota-forecast.test.cjs`、`tests/inject-quota-usage-history.test.cjs`、`tests/overlay-quota-chip.test.cjs`：隔离夹具；不是实际厂商账号凭据测试。
 - OpenRouter 官方文档：[Get remaining credits](https://openrouter.ai/docs/api/api-reference/credits/get-credits)（management key 要求及 `total_credits` / `total_usage` 字段）。
 
 本矩阵描述开发版修复；真账号范围仅限上述接口，部署、重启与正式发布另行记录。

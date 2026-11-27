@@ -12,7 +12,9 @@ const Q = require(path.join(__dirname, "..", "quota-client.cjs"));
  * 按时间范围用量接口（parseUsageHistory / historyDaysToPts + 调度器拉取、节流、回退）。
  * 夹具沿用 quota-client.test.cjs 的注入接缝：now 时钟、fetchImpl、readFile（JSON 读取器，这里直接
  * 返回凭据对象）、enc:v1 测试凭据。订阅端点回非 JSON（maybeGetJson 静默降级），不依赖订阅元数据的
- * 有效期夹具；逐日用量接口缺省回 404（曲线退回采样序列，原有采样用例的断言不变）。 */
+ * 有效期夹具；逐日用量接口缺省回 404（曲线退回采样序列，原有采样用例的断言不变）。
+ * v270：usageHistory:"on-demand" 的客户端只在 refreshUsageHistory（浮层打开预测卡）时拉用量；不传=旧
+ * loader，仍按 ok 结算后拉——两组调度器用例各自保留。 */
 const ENV = { ZCODE_CREDENTIAL_SECRET: "test-secret" };
 const KEY = Q.deriveCipherKey(ENV);
 function encryptValue(plain) {
@@ -85,7 +87,7 @@ function monitorBody(pct, reset) {
   return JSON.stringify({ success: true, data: { level: "max", limits } });
 }
 
-function makeClient({ historyPath, env, onUpdate } = {}) {
+function makeClient({ historyPath, env, onUpdate, usageHistory } = {}) {
   const creds = { "oauth:bigmodel:access_token": encryptValue("jwt.test.token"), "oauth:zai:access_token": encryptValue("jwt.test.token") };
   const clock = { t: T0 + 4 * DAY };
   const calls = [], hist = [];   // calls：额度请求；hist：逐日用量请求 {url, init}
@@ -102,6 +104,7 @@ function makeClient({ historyPath, env, onUpdate } = {}) {
     },
     ...(historyPath ? { historyPath } : {}),
     ...(onUpdate ? { onUpdate } : {}),
+    ...(usageHistory ? { usageHistory } : {}),
   });
   return { client, clock, calls, hist, creds, respond: (fn) => { respond = fn; }, respondHist: (fn) => { respondHist = fn; } };
 }
@@ -399,7 +402,7 @@ test("parseUsageHistory: every malformed shape is rejected, and buckets of anoth
   assert.deepEqual(Q.parseUsageHistory({ success: true, data: { x_time: [hourLabel(L0), hourLabel(L0 + HOUR)], tokensUsage: [-5, 0] } }, L0, LNOW), []);
 });
 
-test("historyDaysToPts: cumulative percent at each finished local midnight scaled to the latest sample; no usage or 0% hands over to the samples", () => {
+test("historyDaysToPts: cumulative percent at each finished local midnight scaled to the sample the caller anchors to; no usage or 0% hands over to the samples", () => {
   assert.deepEqual(Q.historyDaysToPts(FIX_DAYS, L0, LNOW, 30), [[L0 + DAY, 3], [L0 + 2 * DAY, 9], [L0 + 3 * DAY, 9], [L0 + 4 * DAY, 18]]);   // 无用量日（11-25）零点也落顶点：折线走平
   const thirds = [[L0, L0 + DAY, 1], [L0 + DAY, L0 + 2 * DAY, 1], [L0 + 2 * DAY, L0 + 3 * DAY, 1], [L0 + 4 * DAY, L0 + 5 * DAY, 7]];
   assert.deepEqual(Q.historyDaysToPts(thirds, L0, LNOW, 50), [[L0 + DAY, 5], [L0 + 2 * DAY, 10], [L0 + 3 * DAY, 15], [L0 + 4 * DAY, 15]]);   // 11-26 无桶：0% 增量，顶点照落
@@ -411,8 +414,8 @@ test("historyDaysToPts: cumulative percent at each finished local midnight scale
   assert.equal(Q.historyDaysToPts(FIX_DAYS, L0, LNOW, 0), null);
 });
 
-/* ---------- 逐日用量：调度器集成 ---------- */
-test("usage history: the ok settle pulls the period's hourly usage once and the curve becomes a day-by-day polyline scaled to the current percent", async () => {
+/* ---------- 逐日用量：调度器集成（旧 loader：ok 结算后拉） ---------- */
+test("usage history (legacy loader): the ok settle pulls the period's hourly usage once and the curve becomes a day-by-day polyline scaled to that sample", async () => {
   const h = makeClient();
   h.client.noteProvider(BIGMODEL);
   h.respondHist(() => fakeRes(200, fixBody()));
@@ -431,15 +434,15 @@ test("usage history: the ok settle pulls the period's hourly usage once and the 
   h.client.dispose();
 });
 
-test("usage history: pulled at most once per 5 minutes — later settles rescale the cached daily usage, and a new period pulls again", async () => {
+test("usage history (legacy loader): pulled at most once per 5 minutes — a settle inside the window keeps the daily points scaled to the pull-time sample and appends the newer sample; past the window and in a new period it pulls again", async () => {
   const h = makeClient();
   h.client.noteProvider(BIGMODEL);
   h.respondHist(() => fakeRes(200, fixBody()));
   await settleAt(h, LNOW, 30, LRESET);
-  await settleAt(h, LNOW + 4 * MIN, 45, LRESET);      // 节流窗口内：不重拉，按新值重新标定
+  await settleAt(h, LNOW + 4 * MIN, 45, LRESET);      // 节流窗口内：不重拉；逐日点仍标定到拉取时刻的采样（30%），新采样接在后面
   assert.equal(h.hist.length, 1);
-  assert.deepEqual(h.client.view().forecast.pts, [[1440, 4.5], [2880, 13.5], [4320, 13.5], [5760, 27], [6124, 45]]);
-  await settleAt(h, LNOW + 6 * MIN, 46, LRESET);      // 越过 5 分钟：重拉
+  assert.deepEqual(h.client.view().forecast.pts, [[1440, 3], [2880, 9], [4320, 9], [5760, 18], [6120, 30], [6124, 45]]);
+  await settleAt(h, LNOW + 6 * MIN, 46, LRESET);      // 越过 5 分钟：重拉，标定到本次结算
   assert.equal(h.hist.length, 2);
   assert.ok(h.hist[1].url.endsWith("endTime=" + encodeURIComponent(fmtLocal(LNOW + 6 * MIN))));
   assert.deepEqual(h.client.view().forecast.pts, [[1440, 4.6], [2880, 13.8], [4320, 13.8], [5760, 27.6], [6126, 46]]);
@@ -585,4 +588,262 @@ test("usage history: only the forecast adapter pulls usage; the pull follows the
   assert.equal(off.hist.length, 0);
   assert.deepEqual(off.client.view().forecast.pts, [[6120, 30]]);
   off.client.dispose();
+});
+
+/* ---------- 逐日用量：按需拉取（v270：注入侧传 usageHistory:"on-demand"） ---------- */
+const ON_DEMAND = { usageHistory: "on-demand" };
+/* 模拟浮层打开预测卡：主进程转 refreshUsageHistory；等一拍让请求/回执落地后交出 Promise */
+async function openCard(h, id = "bigmodel") {
+  const p = h.client.refreshUsageHistory(id);
+  await flush();
+  return p;
+}
+const POLYLINE = [[1440, 3], [2880, 9], [4320, 9], [5760, 18], [6120, 30]];   // 各完结日零点的累计 %（标定到 30% 采样）+ 标定采样
+
+test("usage history (on-demand): settles only record samples; opening the card pulls the period's hourly usage once, resolves true and the curve becomes the day-by-day polyline", async () => {
+  const h = makeClient(ON_DEMAND);
+  h.client.noteProvider(BIGMODEL);
+  h.respondHist(() => fakeRes(200, fixBody()));
+  await settleAt(h, LNOW, 30, LRESET);
+  assert.equal(h.hist.length, 0, "an ok settle never pulls usage on its own");
+  assert.deepEqual(h.client.view().forecast.pts, [[6120, 30]]);
+  assert.equal(await openCard(h), true);
+  assert.equal(h.hist.length, 1);
+  assert.equal(h.hist[0].url, HISTORY_URL + "?startTime=" + encodeURIComponent(fmtLocal(L0)) + "&endTime=" + encodeURIComponent(fmtLocal(LNOW)));
+  assert.equal(h.hist[0].init.headers.authorization, "jwt.test.token");   // 与额度请求同款裸 authorization
+  const f = h.client.view().forecast;
+  assert.deepEqual(f.pts, POLYLINE);
+  assert.equal(f.pct, 30);
+  assert.ok(Math.abs(f.avg - 30 / 4.25) < 0.001);
+  assert.equal(f.hit, null);
+  assert.equal(f.end, 49.4);
+  assert.equal(h.client.view().sources.bigmodel.forecast, f);
+  assert.deepEqual(h.client._series.get("bigmodel").pts, [[LNOW, 30]], "采样序列照旧记录（接口不可用时的回退）");
+  h.client.dispose();
+});
+
+test("usage history (on-demand): reopening within 5 minutes resolves true from the cache without a request; newer settles keep the earlier days scaled to the pull-time sample; the next open past the window pulls again", async () => {
+  const h = makeClient(ON_DEMAND);
+  h.client.noteProvider(BIGMODEL);
+  h.respondHist(() => fakeRes(200, fixBody()));
+  await settleAt(h, LNOW, 30, LRESET);
+  assert.equal(await openCard(h), true);
+  assert.deepEqual(h.client.view().forecast.pts, POLYLINE);
+  h.clock.t = LNOW + 4 * MIN;
+  assert.equal(await openCard(h), true, "cooldown with a cached result: available without a request");
+  assert.equal(h.hist.length, 1);
+  /* 拉取之后又结算两次（6 小时后 50%、次日 80%）：逐日点仍按拉取时刻的 30% 标定、新采样接续——
+     一律标定到最新采样会把前几天的用量按今天的占比放大（8/24/24/48） */
+  await settleAt(h, LNOW + 6 * HOUR, 50, LRESET);
+  await settleAt(h, LNOW + DAY, 80, LRESET);
+  assert.equal(h.hist.length, 1, "settles alone never pull");
+  assert.deepEqual(h.client.view().forecast.pts, [[1440, 3], [2880, 9], [4320, 9], [5760, 18], [6120, 30], [6480, 50], [7560, 80]]);
+  h.clock.t = LNOW + DAY + 6 * MIN;
+  assert.equal(await openCard(h), true);
+  assert.equal(h.hist.length, 2);
+  assert.ok(h.hist[1].url.endsWith("endTime=" + encodeURIComponent(fmtLocal(LNOW + DAY + 6 * MIN))));
+  assert.deepEqual(h.client.view().forecast.pts, [[1440, 8], [2880, 24], [4320, 24], [5760, 48], [7200, 80], [7560, 80]]);   // 标定采样已过 11-27 日终：该日零点也落顶点
+  h.client.dispose();
+});
+
+test("usage history (on-demand): the anchor skips 0% samples — a period that just started gets its day-by-day curve as soon as usage shows up", async () => {
+  const h = makeClient(ON_DEMAND);
+  h.client.noteProvider(BIGMODEL);
+  h.respondHist(() => fakeRes(200, fixBody()));
+  await settleAt(h, LNOW - MIN, 0, LRESET);
+  assert.equal(await openCard(h), true);             // 周期刚开始时打开：此刻 0%，无可标定，曲线仍是采样序列
+  assert.deepEqual(h.client.view().forecast.pts, [[6119, 0]]);
+  await settleAt(h, LNOW + 9 * MIN, 30, LRESET);     // 离拉取时刻最近的采样还是那个 0%：标定跳到有用量的采样
+  assert.deepEqual(h.client.view().forecast.pts, [[1440, 3], [2880, 9], [4320, 9], [5760, 18], [6129, 30]]);
+  h.client.dispose();
+});
+
+test("usage history (on-demand): a failed or malformed response resolves false and leaves the sampled curve; reopening inside the cooldown neither retries nor reports success; after the cooldown a good response upgrades in place with exactly one push", async () => {
+  let pushes = 0;
+  const h = makeClient(Object.assign({ onUpdate: () => { pushes++; } }, ON_DEMAND));
+  h.client.noteProvider(BIGMODEL);
+  await settleAt(h, LNOW, 30, LRESET);
+  const bad = [() => fakeRes(500, "boom"), () => fakeRes(200, "<html>"),
+    () => fakeRes(200, JSON.stringify({ success: true, data: { x_time: ["2026-11-23 00:00"], tokensUsage: ["a", "b"] } }))];
+  for (let i = 0; i < bad.length; i++) {
+    h.respondHist(bad[i]);
+    h.clock.t = LNOW + 6 * MIN * i;
+    assert.equal(await openCard(h), false, "failure resolves false");
+    assert.deepEqual(h.client.view().forecast.pts, [[6120, 30]], "sample-only curve while the endpoint fails");
+    assert.equal(h.hist.length, i + 1);
+  }
+  assert.equal(h.client.view().status, "ok", "history failures never touch the quota state machine");
+  h.clock.t = LNOW + 13 * MIN;                       // 距上次尝试 1 分钟：失败同样进入冷却，不重试
+  h.respondHist(() => fakeRes(200, fixBody()));
+  assert.equal(await openCard(h), false);
+  assert.equal(h.hist.length, 3);
+  h.clock.t = LNOW + 18 * MIN;
+  const d = deferred();
+  h.respondHist(() => d.promise);
+  const settled = pushes;
+  const p = h.client.refreshUsageHistory("bigmodel");   // 在途：此刻仍是采样曲线
+  await flush();
+  assert.deepEqual(h.client.view().forecast.pts, [[6120, 30]]);
+  d.resolve(fakeRes(200, fixBody()));
+  assert.equal(await p, true);                        // 响应到达：回执 true
+  assert.deepEqual(h.client.view().forecast.pts, POLYLINE);   // 原位换成逐日曲线并推送一次
+  assert.equal(pushes, settled + 1);
+  h.client.dispose();
+});
+
+test("usage history (on-demand): reopening while the first pull is still in flight resolves false and neither starts nor aborts another request; the first response still lands", async () => {
+  const d = deferred();
+  const h = makeClient(ON_DEMAND);
+  h.respondHist(() => d.promise);
+  h.client.noteProvider(BIGMODEL);
+  await settleAt(h, LNOW, 30, LRESET);
+  const first = h.client.refreshUsageHistory("bigmodel");
+  await flush();
+  h.clock.t = LNOW + MIN;
+  assert.equal(await openCard(h), false);
+  assert.equal(h.hist.length, 1);
+  assert.equal(h.hist[0].init.signal.aborted, false);
+  d.resolve(fakeRes(200, fixBody()));
+  assert.equal(await first, true);
+  assert.deepEqual(h.client.view().forecast.pts, POLYLINE);
+  h.client.dispose();
+});
+
+test("usage history (on-demand): a pull that is in flight at dispose resolves false, is dropped and leaves no timer or push behind", async () => {
+  let pushes = 0;
+  const d = deferred();
+  const h = makeClient(Object.assign({ onUpdate: () => { pushes++; } }, ON_DEMAND));
+  h.respondHist(() => d.promise);
+  h.client.noteProvider(BIGMODEL);
+  await settleAt(h, LNOW, 30, LRESET);
+  const p = h.client.refreshUsageHistory("bigmodel");
+  await flush();
+  assert.deepEqual(h.client.view().forecast.pts, [[6120, 30]]);
+  h.client.dispose();
+  const st = h.client._states.get("bigmodel");
+  assert.equal(st.histKill, null);
+  assert.equal(h.hist[0].init.signal.aborted, true);
+  const before = pushes;
+  d.resolve(fakeRes(200, fixBody()));
+  assert.equal(await p, false);
+  assert.equal(pushes, before);
+  assert.equal(st.hist, null);
+  assert.deepEqual(h.client.view().forecast.pts, [[6120, 30]]);
+});
+
+test("usage history (on-demand): a response that lands after the source's credential changed is dropped and resolves false", async () => {
+  const d = deferred();
+  const h = makeClient(ON_DEMAND);
+  h.respondHist(() => d.promise);
+  h.client.noteProvider(BIGMODEL);
+  await settleAt(h, LNOW, 30, LRESET);
+  const p = h.client.refreshUsageHistory("bigmodel");
+  await flush();
+  assert.equal(h.hist.length, 1, "usage request pending");
+  const st = h.client._states.get("bigmodel"), fp = st.fingerprint;
+  h.creds["oauth:bigmodel:access_token"] = encryptValue("jwt.other.token");   // 换账号登录
+  h.respond(() => fakeRes(401, ""));
+  h.clock.t = LNOW + 6 * MIN;
+  h.client.refresh();
+  await flush();
+  assert.equal(h.client.view().status, "auth_failed");
+  assert.notEqual(st.fingerprint, fp);
+  d.resolve(fakeRes(200, fixBody()));
+  assert.equal(await p, false);
+  assert.equal(st.hist, null, "the old credential's usage must not be attached to the new identity");
+  h.client.dispose();
+});
+
+test("usage history (on-demand): refreshUsageHistory resolves false without a request for an unknown source, a non-forecast adapter, a source without an ok weekly window or its reset time, an expired period, or a disposed client", async () => {
+  const h = makeClient(ON_DEMAND);
+  h.client.noteProvider(BIGMODEL);
+  h.respondHist(() => fakeRes(200, fixBody()));
+  assert.equal(await openCard(h), false, "no ok value yet");
+  await settleAt(h, LNOW, 30, LRESET);
+  assert.equal(await openCard(h, "no-such-source"), false);
+  assert.equal(await openCard(h, ""), false);
+  assert.equal(await openCard(h), true);              // 对照：同一源 id 可拉
+  h.clock.t = LRESET + MIN;
+  assert.equal(await openCard(h), false, "period over");
+  h.clock.t = LNOW + 6 * MIN;
+  h.client.dispose();
+  assert.equal(await openCard(h), false, "disposed");
+  assert.equal(h.hist.length, 1, "only the valid open reached the network");
+  const noReset = makeClient(ON_DEMAND);
+  noReset.client.noteProvider(BIGMODEL);
+  await settleAt(noReset, LNOW, 30, null);            // 周窗在、但接口不再给重置时刻
+  assert.equal(noReset.client.view().windows.weekly.percent, 30);
+  assert.equal(await openCard(noReset), false);
+  assert.equal(noReset.hist.length, 0);
+  noReset.client.dispose();
+  const zai = makeClient(ON_DEMAND);
+  zai.client.noteProvider("account:zai-pro");
+  await settleAt(zai, LNOW, 30, LRESET);
+  assert.equal(zai.client.view().status, "ok");
+  assert.equal(await openCard(zai, "zai"), false);
+  assert.equal(zai.hist.length, 0);
+  zai.client.dispose();
+});
+
+test("usage history (on-demand): once the limit is reached the sampled curve stays even with daily usage at hand — the hit time comes from samples, not day boundaries", async () => {
+  const h = makeClient(ON_DEMAND);
+  h.client.noteProvider(BIGMODEL);
+  h.respondHist(() => fakeRes(200, fixBody()));
+  await settleAt(h, LNOW - HOUR, 60, LRESET);
+  assert.equal(await openCard(h), true);
+  assert.deepEqual(h.client.view().forecast.pts, [[1440, 6], [2880, 18], [4320, 18], [5760, 36], [6060, 60]]);
+  await settleAt(h, LNOW + 6 * MIN, 100, LRESET);
+  const f = h.client.view().forecast;
+  assert.deepEqual(f.pts, [[6060, 60], [6126, 100]]);
+  assert.equal(f.hit, LNOW + 6 * MIN);
+  h.client.dispose();
+});
+
+test("usage history (on-demand): only the forecast adapter has usage to pull; the pull follows the quota URL override and is skipped without a request when the override is unparseable", async () => {
+  const h = makeClient(Object.assign({ env: { ZCODE_BIGMODEL_USAGE_QUOTA_URL: "http://127.0.0.1:65535/quota" } }, ON_DEMAND));
+  h.client.noteProvider(BIGMODEL);
+  h.respondHist(() => fakeRes(200, fixBody()));
+  await settleAt(h, LNOW, 30, LRESET);
+  assert.equal(await openCard(h), true);
+  assert.equal(h.hist[0].url.indexOf("http://127.0.0.1:65535/api/monitor/usage/model-usage?startTime="), 0);
+  h.client.dispose();
+
+  const off = makeClient(Object.assign({ env: { ZCODE_BIGMODEL_USAGE_QUOTA_URL: "not a url" } }, ON_DEMAND));
+  off.client.noteProvider(BIGMODEL);
+  await settleAt(off, LNOW, 30, LRESET);
+  assert.equal(await openCard(off), false);
+  assert.equal(off.hist.length, 0);
+  assert.deepEqual(off.client.view().forecast.pts, [[6120, 30]]);
+  off.client.dispose();
+});
+
+test("usage history (on-demand): a new period never reuses the previous period's days, and its own failed pull leaves the new series alone", async () => {
+  const h = makeClient(ON_DEMAND);
+  h.client.noteProvider(BIGMODEL);
+  h.respondHist(() => fakeRes(200, fixBody()));
+  await settleAt(h, LNOW, 30, LRESET);
+  assert.equal(await openCard(h), true);
+  assert.deepEqual(h.client.view().forecast.pts, POLYLINE);
+  await settleAt(h, LRESET + 2 * DAY + HOUR, 3, LRESET + WEEK);
+  assert.deepEqual(h.client.view().forecast.pts, [[2940, 3]], "the previous period's days are not carried over");
+  h.respondHist(() => fakeRes(500, "boom"));
+  assert.equal(await openCard(h), false);
+  assert.equal(h.hist.length, 2);
+  assert.deepEqual(h.client.view().forecast.pts, [[2940, 3]]);
+  h.clock.t += MIN;                                  // 冷却期内再打开：上一周期留下的缓存不算本周期的结果，也不重试
+  assert.equal(await openCard(h), false, "the previous period's cache is not this period's result");
+  assert.equal(h.hist.length, 2);
+  h.client.dispose();
+});
+
+test("usage history (on-demand): the pull promise settles even when the update callback throws", async () => {
+  let boom = false;
+  const h = makeClient(Object.assign({ onUpdate: () => { if (boom) throw new Error("push failed"); } }, ON_DEMAND));
+  h.client.noteProvider(BIGMODEL);
+  h.respondHist(() => fakeRes(200, fixBody()));
+  await settleAt(h, LNOW, 30, LRESET);
+  boom = true;
+  assert.equal(await openCard(h), false, "a throwing callback never leaves the receipt pending");
+  assert.equal(h.client._states.get("bigmodel").histKill, null, "the request timer is cleared all the same");
+  h.client.dispose();
 });

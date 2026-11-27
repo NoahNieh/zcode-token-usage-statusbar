@@ -1694,9 +1694,9 @@ function parseUsageHistory(body, start, end) {
   }
   return Array.from(days.values()).sort((a, b) => a[0] - b[0]);
 }
-/* 逐日 token → 逐日累计已用 %（等比标定到最新采样的 pct）：自周期起点所在日起逐个本地日累加，顶点落在
- * 每个已完结日的本地零点（没有桶的日按 0 用量，折线在无用量日走平）；未完结的当日不落顶点，由调用方
- * 在末尾接 (最新采样时刻, 当前值)。无用量或当前 0% 返回 null（交给采样序列）。 */
+/* 逐日 token → 逐日累计已用 %（等比标定到标定采样的 pct，由调用方选定）：自周期起点所在日起逐个本地日
+ * 累加，顶点落在每个已完结日的本地零点（没有桶的日按 0 用量，折线在无用量日走平）；未完结的当日不落
+ * 顶点，由调用方接上标定采样及其后的采样（末端=最新采样）。无用量或标定 0% 返回 null（交给采样序列）。 */
 function historyDaysToPts(days, start, t, pct) {
   let total = 0;
   for (const d of days) total += d[2];
@@ -1761,6 +1761,9 @@ function createQuotaClient(opts) {
    * secretsPath 绝不派生出落盘路径。文件只存归一化后的时间与已用 %（无凭据/订阅字段）；
    * 缺失/损坏按空起步，读写失败静默（不拖累额度主链）；保存时顺手清掉已过期周期。 */
   const historyPath = typeof o.historyPath === "string" && o.historyPath ? o.historyPath : "";
+  /* v270 逐日用量的拉取时机：注入侧传 "on-demand" → 只在浮层打开预测卡时经 refreshUsageHistory 拉取；
+   * 未传（旧 loader，不认识 quota-usage-history 动作）沿用每次 ok 结算后拉取。 */
+  const usageHistoryOnDemand = o.usageHistory === "on-demand";
   const series = new Map();
   let disposed = false;
   if (historyPath) {
@@ -1804,41 +1807,62 @@ function createQuotaClient(opts) {
     series.set(st.id, next);
     st.forecast = effectiveForecast(st);
     saveHistory();
-    loadUsageHistory(st, win.resetsAt, t);
+    if (!usageHistoryOnDemand) loadUsageHistory(st, win.resetsAt, t);
   }
-  /* 实际下发的曲线：有本周期的接口逐日用量 → 逐日累计点 + (最新采样, 当前值)；否则用采样序列。
-   * 已达上限时仍用采样序列——用尽时刻取首个 ≥100% 的采样，日粒度会晚到次日零点。 */
+  /* 实际下发的曲线：有本周期的接口逐日用量 → 逐日累计点 + 其后的采样（末端=最新采样/当前值）；
+   * 否则用采样序列。已达上限时仍用采样序列——用尽时刻取首个 ≥100% 的采样，日粒度会晚到次日零点。
+   * v270：逐日点只标定到与拉取时刻（hist.at）最近的采样——按需拉取后 hist 可能早于最新采样，
+   * 一律标定到最新采样会把前几天的用量按今天的占比放大；标定点及其后的采样原样接续（标定点
+   * = 当日到标定时刻的累计，折线在当日不跳变）。 */
   function effectiveForecast(st) {
     const s = series.get(st.id), hist = st.hist;
     if (!s || !s.pts.length) return null;
     const last = s.pts[s.pts.length - 1];
-    const daily = last[1] < 100 && hist && hist.reset === s.reset ? historyDaysToPts(hist.days, s.reset - WEEK_MS, last[0], last[1]) : null;
-    return forecastWeekly(daily ? { reset: s.reset, pts: daily.concat([last]) } : s, last[0]);
+    let pts = s.pts;
+    if (last[1] < 100 && hist && hist.reset === s.reset && typeof hist.at === "number") {
+      let k = -1;
+      for (let i = 0; i < s.pts.length; i++) {
+        if (s.pts[i][1] > 0 && (k < 0 || Math.abs(s.pts[i][0] - hist.at) < Math.abs(s.pts[k][0] - hist.at))) k = i;
+      }
+      const daily = k < 0 ? null : historyDaysToPts(hist.days, s.reset - WEEK_MS, s.pts[k][0], s.pts[k][1]);
+      if (daily) pts = daily.concat(s.pts.slice(k));
+    }
+    return forecastWeekly({ reset: s.reset, pts }, last[0]);
   }
   /* 拉 monitor 的按时间范围用量（可选增强：任何失败静默，曲线退回采样序列，不进退避/代际状态机）。
-   * 每源每周期按 USAGE_HISTORY_MIN_INTERVAL_MS 节流；在途请求被新请求/卸载中止。代际守卫：响应
-   * 到达时实例已 dispose、源凭据指纹已变或已被更新的请求取代则丢弃。 */
+   * 每源每周期按 USAGE_HISTORY_MIN_INTERVAL_MS 节流（失败同样计入，防反复打开浮层打爆接口）；在途
+   * 请求被新请求/卸载中止。代际守卫：响应到达时实例已 dispose、源凭据指纹已变或已被更新的请求
+   * 取代则丢弃。返回 Promise<boolean>：true=本周期的逐日用量此刻可用（本次拉到，或冷却期内的
+   * 缓存）；false=不可拉/节流且无缓存/任何失败。按需拉取（refreshUsageHistory）据此回执。 */
   function loadUsageHistory(st, reset, t) {
     const a = adapterOf(st.id);
-    const base = a && typeof a.usageHistoryUrl === "function" ? a.usageHistoryUrl(j) : null;
-    if (!base || !(st.cred && typeof st.cred.token === "string" && st.cred.token)) return;
-    if (st.histReset === reset && st.histAt && t - st.histAt < USAGE_HISTORY_MIN_INTERVAL_MS) return;
+    if (!a || !a.forecast || typeof a.usageHistoryUrl !== "function") return Promise.resolve(false);   // 只有声明 forecast 的适配器（BigModel）有用量接口
+    const base = a.usageHistoryUrl(j);
+    if (!base || !(st.cred && typeof st.cred.token === "string" && st.cred.token)) return Promise.resolve(false);
+    if (st.histReset === reset && st.histAt && t - st.histAt < USAGE_HISTORY_MIN_INTERVAL_MS) {
+      return Promise.resolve(!!(st.hist && st.hist.reset === reset));
+    }
     if (st.histKill) { clearTimeout(st.histKill); st.histKill = null; }
     if (st.histCtl) { try { st.histCtl.abort(); } catch (e) { } }
     const ctl = new AbortController(), fp = st.fingerprint, start = reset - WEEK_MS;
     st.histCtl = ctl; st.histAt = t; st.histReset = reset;
     const url = base + "?startTime=" + encodeURIComponent(fmtLocalTime(start)) + "&endTime=" + encodeURIComponent(fmtLocalTime(t));
-    const done = () => { if (st.histKill) { clearTimeout(st.histKill); st.histKill = null; } };
-    st.histKill = setTimeout(() => { try { ctl.abort(); } catch (e) { } }, FETCH_TIMEOUT_MS);
-    http.maybeGetJson(url, { authorization: (a.usageHistoryBearer ? "Bearer " : "") + st.cred.token }, ctl).then((body) => {
-      done();
-      if (disposed || st.fingerprint !== fp || st.histCtl !== ctl) return;
-      const days = parseUsageHistory(body, start, t);
-      if (!days) return;
-      st.hist = { reset, days };
-      st.forecast = effectiveForecast(st);
-      if (onUpdate) onUpdate();
-    }, done);
+    return new Promise((resolve) => {
+      const done = (ok) => {   // 成功/失败/抛错都到这里：清定时器并回执（resolve 至多一次）
+        if (st.histKill) { clearTimeout(st.histKill); st.histKill = null; }
+        resolve(ok);
+      };
+      st.histKill = setTimeout(() => { try { ctl.abort(); } catch (e) { } }, FETCH_TIMEOUT_MS);
+      http.maybeGetJson(url, { authorization: (a.usageHistoryBearer ? "Bearer " : "") + st.cred.token }, ctl).then((body) => {
+        if (disposed || st.fingerprint !== fp || st.histCtl !== ctl) return false;
+        const days = parseUsageHistory(body, start, t);
+        if (!days) return false;
+        st.hist = { reset, days, at: t };
+        st.forecast = effectiveForecast(st);
+        if (onUpdate) onUpdate();
+        return true;
+      }).then(done, () => done(false));   // 单独一个 then：接得住上一段成功分支里抛出的异常（同段拒绝分支接不到）
+    });
   }
 
   /* HTTP 助手：分类错误（401/403 auth_failed、429 rate_limited、5xx/其它 network_error、
@@ -2383,6 +2407,16 @@ function createQuotaClient(opts) {
         for (const st of states.values()) if (adapterOf(st.id) === a) started = tickSource(a, st, true) || started;
       }
       return started;
+    },
+    /* v270：按需拉本源本周期的逐日用量（浮层打开预测卡 → 主进程 quota-usage-history → 此处）。
+     * id=完整源 id（chip 的 quotaSourceId）；只对已有周窗值、重置时刻有效且周期未过的源发起（适配器
+     * 与凭据门控在 loadUsageHistory）。resolve true=逐日用量此刻可用（曲线随下一次快照下发），
+     * false=不可拉/节流且无缓存/失败。 */
+    refreshUsageHistory(id) {
+      const st = states.get(typeof id === "string" ? id.slice(0, 256) : "");
+      const win = st && st.value && st.value.windows ? st.value.windows.weekly : null;
+      if (disposed || !st || !win || !(now() < win.resetsAt)) return Promise.resolve(false);   // 重置时刻缺失/非数值/周期已过：比较为假
+      return loadUsageHistory(st, win.resetsAt, now());
     },
     noteProvider(providerId) {
       const p = String(providerId || "");

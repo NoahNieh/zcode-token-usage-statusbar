@@ -50,7 +50,7 @@
 | `install_monitor.py` | 重启提醒、加载诊断和 Windows 待替换收尾 |
 | `plugin-updater.cjs` / `plugin-release.cjs` | 宿主插件更新调度、正式 GitHub Release 与渠道校验、更新日志（Release 说明）拉取与缓存 |
 | `plugin-storage.cjs` | 按宿主存储解析用户级插件库存/缓存，不假设固定 HOME |
-| `quota-client.cjs` | 套餐额度客户端（主进程，热换）：解密宿主 OAuth 凭据（`enc:v1`/`enc:v2` AES-256-GCM 重写实现，v2 主密钥按需读 OS 凭据库）直查 BigModel/Z.ai monitor 端点，归一化窗口/退避/冻结/epoch 竞态，凭据只在内存；BigModel 周窗用量预测（逐日曲线取自 monitor 按时间范围用量接口，接口不可用时回退采样序列 `quota-history.json`，均无凭据） |
+| `quota-client.cjs` | 套餐额度客户端（主进程，热换）：解密宿主 OAuth 凭据（`enc:v1`/`enc:v2` AES-256-GCM 重写实现，v2 主密钥按需读 OS 凭据库）直查 BigModel/Z.ai monitor 端点，归一化窗口/退避/冻结/epoch 竞态，凭据只在内存；BigModel 周窗用量预测（逐日曲线取自 monitor 按时间范围用量接口、v270 起按需拉取，接口不可用时回退采样序列 `quota-history.json`，均无凭据） |
 | `runtime_lock.py` / `release_unpack.py` | 跨进程锁、配置事务/可信同步、安全 ZIP 解包 |
 | `sync_plugin.py` / `release_tool.py` | 根源码副本同步；确定性发布包构建、校验、发布预演/发布 |
 | `plugins/zcode-token-usage-statusbar/` | 两份 manifest、`.mcp.json`、命令、技能、hooks、专有安装/更新/提醒入口与共享副本 |
@@ -146,7 +146,7 @@ python3 sync_plugin.py --check
 - **凭据契约**：发现优先级 env → `quota-secrets.json`（运行目录 0600，⚙ 面板 write-only 写入）→ 自动发现（宿主 provider_config.json；Anthropic 另读 `~/.claude/.credentials.json`，披露已单独列明）。发 key 域白名单=各适配器官方域 + 用户自定义中转的本域，绝不发第三方；凭据只在内存，绝不进 config.json/日志/诊断/diag。
 - 401/403 与无套餐冻结到凭据指纹变化（fs.watch credentials.json + quota-secrets/provider_config mtime 失效即解冻）；JWT exp 临期不发请求；失败保留最近成功值并标 stale；解密失败/no_plan/parse_error 一律 fail-closed，绝不显示 0%。
 - 显示门控：会话首个完成的 `main_turn`（快照 `last.provider_id`，已滤辅助请求污染）出现前，chip 跟随快照顶层 `provider_fallback`（全局最近 account:* 请求）；会话最新请求是自定义 provider 时显示对应自定义源（官方域直连/中转探测）。团队套餐显示"暂不支持"。SSH 远端分栏直接显示本地额度（宿主 provisioning 同账号事实）。chip 挂原生上下文按钮左侧，同款双 reapply/还原契约；⚙ 面板每源独立开关/凭据/立即刷新，状态中性提示（无凭据/无订阅不报红）。
-- **BigModel 周窗用量预测（v269）**：只用额度链自身数据外推，不借本地 token 统计——预测锚点=每次 ok 结算记的 `(时间, 已用%)` 采样，序列按 `resetsAt` 分周期、落运行目录 `quota-history.json`（仅时间与百分比；`historyPath` 由 `inject-main.cjs` 显式传入，未传仅内存，不得从 secrets/凭据路径派生）；曲线首选 monitor 的按时间范围用量接口（`model-usage`，与额度请求同域同凭据；小时桶按本地日聚合、以当前已用 % 等比标定成逐日累计点——额度接口只给整数百分比；桶值不按范围裁剪，跨周期起点的首桶按时间折算；每源每周期 5 分钟节流，失败/形状不符/迟到（dispose、凭据指纹变化）一律静默退回采样序列）；预测 = 周期起点（`resetsAt` − 7 天）至今的日均外推 `hit`（周期内到达 100% 的时刻，晚于重置为 null）/`end`（周期末已用 %），经快照 `forecast` 字段下发；渲染端额度 tooltip 挂预测卡（恒已用口径），stale/非 ok/周期过期/旧快照整块隐藏。细则见 [quota.md](.zcode/rules/quota.md) §8。
+- **BigModel 周窗用量预测（v269）**：只用额度链自身数据外推，不借本地 token 统计——预测锚点=每次 ok 结算记的 `(时间, 已用%)` 采样，序列按 `resetsAt` 分周期、落运行目录 `quota-history.json`（仅时间与百分比；`historyPath` 由 `inject-main.cjs` 显式传入，未传仅内存，不得从 secrets/凭据路径派生）；曲线首选 monitor 的按时间范围用量接口（`model-usage`，与额度请求同域同凭据；小时桶按本地日聚合、以**标定采样**的已用 % 等比标定成逐日累计点——额度接口只给整数百分比；桶值不按范围裁剪，跨周期起点的首桶按时间折算；每源每周期 5 分钟节流，失败/形状不符/迟到（dispose、凭据指纹变化）一律静默退回采样序列）；**逐日用量按需拉取（v270）**：额度 tooltip 从隐藏到显示且预测卡可显示时，渲染端发一次 `quota-usage-history`（chip 当前源 id，不等回执），主进程转 `quotaClient.refreshUsageHistory(id)`——注入侧传 `usageHistory:"on-demand"`，未传的旧 loader 沿用「ok 结算后拉取」；冷却与失败兜底在源侧（渲染端不设时钟），悬停中的数据刷新不重发；标定采样=离拉取时刻最近且已用 >0 的采样，其后的采样原样接续（缓存早于最新采样时不得把前几天用量按今天占比放大）；预测 = 周期起点（`resetsAt` − 7 天）至今的日均外推 `hit`（周期内到达 100% 的时刻，晚于重置为 null）/`end`（周期末已用 %），经快照 `forecast` 字段下发；渲染端额度 tooltip 挂预测卡（恒已用口径），stale/非 ok/周期过期/旧快照整块隐藏。细则见 [quota.md](.zcode/rules/quota.md) §8。
 - SCNet 无凭据账本估算走外部快照 + 抵扣表（`SCNET_CREDIT_RATES`）× modelPatterns 在 zusage 侧聚合，随快照顶层 `scnet_estimate` 注入。
 - 额度只进桌面快照链；MCP、CLI、`/usage` stdout 契约不加字段。Web 端不做（sidecar 无凭据）。
 - 窗口分类、有效期解析细则、各家适配器陷阱、自定义中转、apiKey 模式、退避阶梯、路径契约（issue #56）等见 [.zcode/rules/quota.md](.zcode/rules/quota.md)——改 `quota-client.cjs` 或额度 UI 前必读。
@@ -199,7 +199,7 @@ python3 sync_plugin.py --check
 | 改动范围 | 验证选择（文件位于 `tests/`） |
 |---|---|
 | 统计/速率 | `test_token_rate.py`、`test_statusbar_rate.py`、`test_statusbar_cost.py`、`test_token_pricing.py`、`overlay-rate.test.cjs`、`overlay-cost-tip.test.cjs`、`overlay-speed-chart.test.cjs`；更改共享 JSON 时加入远端及插件契约回归 |
-| 套餐额度 | `quota-client.test.cjs`、`quota-forecast.test.cjs`、`opencode-quota.test.cjs`、`quota-paths.test.cjs`、`quota-provider-revoke.test.cjs`、`quota-source-lifecycle.test.cjs`、`sub2api-protocol.test.cjs`、`overlay-quota-chip.test.cjs`、`test_statusbar_rate.py`（provider_fallback/scnet 估算）；真实厂商响应、凭据刷新解冻与 chip 实机挂载需桌面验收，unverified 适配器待真实账号校准 |
+| 套餐额度 | `quota-client.test.cjs`、`quota-forecast.test.cjs`、`inject-quota-usage-history.test.cjs`、`opencode-quota.test.cjs`、`quota-paths.test.cjs`、`quota-provider-revoke.test.cjs`、`quota-source-lifecycle.test.cjs`、`sub2api-protocol.test.cjs`、`overlay-quota-chip.test.cjs`、`test_statusbar_rate.py`（provider_fallback/scnet 估算）；真实厂商响应、凭据刷新解冻与 chip 实机挂载需桌面验收，unverified 适配器待真实账号校准 |
 | 浮层/主桥 | `overlay-*.test.cjs`、`plugin-loader.test.cjs`、`plugin-restart-boot.test.cjs`；语法检查，布局/多窗口需桌面验收 |
 | 桥/SSH 路由 | `test_renderer_bridge.py`、`test_bridge_pending.py`、`test_remote_targets.py`、`inject-remote-recovery.test.cjs`、`overlay-remote-scope.test.cjs`；实机身份/重连与认证另验 |
 | 安装/更新/锁/解包 | `test_install_discovery.py`、`test_plugin_sudo_install.py`、`test_pending_asar.py`、`test_config_transactions.py`、`test_runtime_sync_guard.py`、`test_release*.py` 及 `plugin-*.test.cjs`、`runtime-lock.test.cjs` |

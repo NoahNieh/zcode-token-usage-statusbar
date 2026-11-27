@@ -1393,3 +1393,72 @@ test('forecast card: day-by-day vertices (vendor usage history) draw as a polyli
   assert.match(html, /<text class="qt-fc-fct" x="426" y="55\.55" text-anchor="end">49\.4%<\/text>/);
   assert.doesNotMatch(html, /<circle class="qt-fc-hitc"/);
 });
+
+/* ---------- v270 逐日用量按需拉取：额度 tooltip 从隐藏到显示时发一次 quota-usage-history ---------- */
+const historyReqs = h => h.window.__zusagePluginRequests.filter(r => r.action === 'quota-usage-history');
+const stage3 = entry => ({ active: 'bigmodel', sources: { bigmodel: entry } });   // stage-3 协议：account 档 → 源 id bigmodel
+
+test('v270: opening the quota tooltip over a visible forecast card queues exactly one quota-usage-history for the chip\'s source; hover-time refreshes never resend; reopening does', () => {
+  const { h, ui } = booted();
+  h.window.__zusageUpdate(h.payload({ quota: stage3(withForecast(forecastFixture())) }));
+  const chip = h.chipOf(ui.wrap), tip = h.tipEl();
+  const enter = () => chip.listeners.get('mouseenter')[0].call(chip);
+  const leave = () => chip.listeners.get('mouseleave')[0].call(chip);
+  assert.equal(historyReqs(h).length, 0, 'nothing before the tooltip is opened');
+  enter();
+  assert.equal(tip.style.display, 'block');
+  assert.equal(historyReqs(h).length, 1);
+  assert.equal(historyReqs(h)[0].sourceId, 'bigmodel');
+  assert.equal(historyReqs(h)[0].requestId, undefined, 'fire-and-forget: the curve arrives with the next snapshot');
+  h.tick(); h.tick();                                                 // 500ms 扫描 + 600ms heavy 对账：悬停中重跑 showQuotaTip
+  assert.equal(historyReqs(h).length, 1, 'reconciles while open never resend');
+  h.window.__zusageUpdate(h.payload({ quota: stage3(withForecast(forecastFixture('safe', { pct: 61 }))) }));   // 悬停中数据刷新
+  assert.match(tip.innerHTML, /<div class="qt-fc-t">本周已用 <b class="qt-fc-n">61%<\/b><\/div>/);
+  assert.equal(historyReqs(h).length, 1, 'a data refresh while hovering never resends');
+  leave();
+  assert.equal(tip.style.display, 'none');
+  h.tick(); h.tick();
+  h.window.__zusageUpdate(h.payload({ quota: stage3(withForecast(forecastFixture())) }));
+  assert.equal(historyReqs(h).length, 1, 'closed tooltip: nothing is sent');
+  enter();
+  assert.equal(historyReqs(h).length, 2, 'reopening pulls again (the cooldown lives in the main process)');
+});
+
+test('v270: no quota-usage-history unless the forecast card is showing — missing forecast, stale, failed, expired window, malformed forecast', () => {
+  const { h, ui } = booted();
+  const cases = [
+    stage3(QUOTA_OK),                                                             // 旧主进程条目：无 forecast
+    stage3(Object.assign(withForecast(forecastFixture()), { stale: true })),
+    stage3(Object.assign(withForecast(forecastFixture()), { status: 'network_error' })),
+    stage3(withForecast(forecastFixture('safe', { reset: Date.now() - 1000 }))),  // 周期已过（at 早于 reset，形状门通过）
+    stage3(withForecast(forecastFixture('safe', { at: 'x' }))),                  // 形状不符
+  ];
+  for (const quota of cases) {
+    h.window.__zusageUpdate(h.payload({ quota }));
+    const chip = h.chipOf(ui.wrap), tip = h.tipEl();
+    chip.listeners.get('mouseenter')[0].call(chip);
+    assert.equal(tip.style.display, 'block');
+    assert.doesNotMatch(tip.innerHTML, /class="qt-fc"/);
+    assert.equal(historyReqs(h).length, 0);
+    chip.listeners.get('mouseleave')[0].call(chip);
+  }
+});
+
+test('v270: the old flat quota protocol shows the card but has no source id to ask for — no request is queued', () => {
+  const { h, ui } = booted();
+  const tip = showTip(h, withForecast(forecastFixture()), ui);   // 平铺协议（无 sources）：旧主进程不认识该动作
+  assert.match(tip.innerHTML, /class="qt-fc"/);
+  assert.equal(historyReqs(h).length, 0);
+});
+
+test('v270: an apiKey-mode session demands its own composite source id (byProvider mapping)', () => {
+  const { h, ui } = booted();
+  h.window.__zusageUpdate(h.payload({ provider: 'bigmodel-api-2',
+    quota: { active: 'bigmodel:bigmodel-api-2', byProvider: { 'bigmodel-api-2': 'bigmodel:bigmodel-api-2' },
+      sources: { 'bigmodel:bigmodel-api-2': withForecast(forecastFixture()) } } }));
+  const chip = h.chipOf(ui.wrap);
+  chip.listeners.get('mouseenter')[0].call(chip);
+  assert.match(h.tipEl().innerHTML, /class="qt-fc"/);
+  assert.equal(historyReqs(h).length, 1);
+  assert.equal(historyReqs(h)[0].sourceId, 'bigmodel:bigmodel-api-2');
+});

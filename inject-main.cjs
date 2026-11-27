@@ -924,6 +924,7 @@ function createQuotaClientInstance() {
       ...quotaPaths,
       secretsPath: QUOTA_SECRETS,
       historyPath: path.join(HERE, "quota-history.json"),   // v269：周窗采样序列（时间 + 已用 %，无凭据）；未传则 quota-client 仅内存
+      usageHistory: "on-demand",   // v270：逐日用量只在浮层打开预测卡时拉（quota-usage-history）；不传=结算后拉（旧 loader 同款）
       quotaEnabled,
       resetEnabled: resetBadgeEnabled,
       resetList: true,   // v135：bigmodel 族并行查网页控制台列表端点（近 7 天过期卡 + 上次重置）
@@ -1315,6 +1316,26 @@ function deliverPluginRequest(wc, requestId, result) {
   if (!wc || wc.isDestroyed() || !isLocalHostPage(wc) || typeof requestId !== "string" || requestId.length > 120) return Promise.resolve(false);
   const js = "window.__zusagePluginResult && window.__zusagePluginResult(" + JSON.stringify(Object.assign({ id: requestId }, result || {})) + ")";
   return wc.executeJavaScript(js, true).then(() => true).catch(() => false);
+}
+/* ---------- v270 周额度预测卡的逐日用量：按需拉取 ----------
+ * 渲染端打开额度 tooltip 时发 pluginRequest("quota-usage-history", {sourceId})（chip 当前源的完整
+ * id）。只读 monitor 用量接口、不占常驻泵；节流在 quota-client 侧（每源每周期 5 分钟，失败同样
+ * 计入），渲染端不设时钟。回执 ok=本周期逐日用量此刻可用（曲线随下一次快照下发，不在回执里）；
+ * 节流无缓存/失败/源不可拉一律 ok:false——渲染端维持采样序列，不报错。 */
+function handleQuotaUsageHistory(req, wc) {
+  const respond = (result) => deliverPluginRequest(wc, req.requestId, result);
+  const id = typeof req.sourceId === "string" ? req.sourceId : "";
+  if (!id || id.length > 256) { respond({ ok: false, error: "invalid source" }); return; }
+  if (!quotaClient || !quotaEnabled() || typeof quotaClient.refreshUsageHistory !== "function") {
+    respond({ ok: false, error: "usage history unavailable" });
+    return;
+  }
+  quotaClient.refreshUsageHistory(id).then((ok) => {
+    respond(ok ? { ok: true } : { ok: false, error: "usage history unavailable" });
+  }, (e) => {
+    LOG("usage history failed:", e && e.message);
+    respond({ ok: false, error: "usage history failed" });
+  });
 }
 /* ---------- v265 用量报表「自选范围」按需查询 ----------
  * 渲染端 pluginRequest("report-range", {from,to}) → 一次性 execFile zusage.py
@@ -1880,6 +1901,8 @@ async function pollPluginRequests() {
           queryTurnText(req.sid, wc, req.cn === 0, req.forceKmb === true, req.unitEpoch);
         } else if (req && req.action === "report-range") {   // v265：⚙ 用量报表自选范围（一次性 execFile，低频）
           queryReportRange(req, wc);
+        } else if (req && req.action === "quota-usage-history") {   // v270：额度 tooltip 打开预测卡 → 按需拉本周期的逐日用量
+          handleQuotaUsageHistory(req, wc);
         } else if (req && req.action === "git-refresh") {   // v96：Git chip 点击 / 快照后节流：立即重查全部已关注路径
           gitTick(true, req.requestId, wc, req.path).catch(() => { });
         } else if (req && req.action === "relaunch") {   // v172：⚙ 更新页「重启 ZCode」按钮（浮层已二次确认）
